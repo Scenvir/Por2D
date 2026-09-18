@@ -20,6 +20,43 @@ std::string pose(const Player& p) {
     return s.str();
 }
 
+void boundaryRestart() {
+    TileMap empty;
+    std::array<Portal, 2> portals{};
+    CollisionWorld world(empty, portals);
+    for (int direction = 0; direction < 4; ++direction) {
+        Body body{{400, 300}, static_cast<Direction>(direction)};
+        const std::array<Vec2, 4> edges{{{0, 300}, {WindowWidth-body.width(), 300},
+                                       {400, 0}, {400, WindowHeight-body.height()}}};
+        const std::array<Vec2, 4> outward{{{-10, 0}, {10, 0}, {0, -10}, {0, 10}}};
+        for (int edge = 0; edge < 4; ++edge) {
+            Player player;
+            player.body = body;
+            player.body.position = edges[edge];
+            PortalMotion motion;
+            expect(!world.move(player, motion, {}), "touching any boundary requests restart");
+            player.body.position = edges[edge] - outward[edge] * 0.05;
+            player.velocity = outward[edge];
+            motion = {};
+            expect(!world.move(player, motion, {}), "moving into any boundary requests restart");
+
+            Game game;
+            const auto spawn = game.player().body.position;
+            const auto level = game.level().id;
+            auto& fixture = const_cast<Player&>(game.player());
+            fixture.body = body;
+            fixture.body.position = edges[edge];
+            game.tick({});
+            expect(game.level().id == level && near(game.player().body.position, spawn),
+                   "boundary contact restarts the same level at its spawn");
+        }
+    }
+    Player safe;
+    safe.body.position = {400, 300};
+    PortalMotion motion;
+    expect(world.move(safe, motion, {}), "interior movement remains safe");
+}
+
 void mapsAndTransforms() {
     // Maps are user-editable; only portal transforms remain a legacy oracle.
     for (int id = 0; id <= 16; ++id) {
@@ -505,6 +542,7 @@ void gravityControls() {
 
 int main() {
     const std::pair<const char*, std::function<void()>> suites[]{
+        {"boundary contact restarts current level", boundaryRestart},
         {"non-mutating placement preview and actual portal position", placementPreview},
         {"four gravity directions, screen controls, support and portal stress", gravityControls},
         {"editable level data and 64 invertible portal transforms", mapsAndTransforms},
