@@ -1,3 +1,8 @@
 /build/
 /build-*/
 __pycache__/
+
+# Local development documents; kept on disk but not published.
+/新手教程.md
+/DESIGN_NOTES.md
+/VERIFICATION.md
