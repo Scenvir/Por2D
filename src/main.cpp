@@ -45,6 +45,7 @@ struct Application {
     std::vector<por2::Shot> shots;
     bool debug = true;
     bool grid = false;
+    int previewPortal = 0;
     bool exitPressed = false;
     int gravityTurns = 0;
     std::string title;
@@ -209,7 +210,16 @@ struct Application {
         if(!menu) game.tick(input);
         if(smoke && menu && (before.x!=game.player().body.position.x || before.y!=game.player().body.position.y))
             throw std::runtime_error("menu did not freeze physics");
-        renderer.draw(game, debug, grid);
+        std::optional<por2::Shot> preview;
+        if (!menu && !smoke && GetForegroundWindow()==window) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) && ScreenToClient(window,&cursor)) {
+                const auto point=logicalPoint(window,cursor.x,cursor.y);
+                if (point) preview=por2::Shot{previewPortal,*point};
+            }
+        }
+        if(smoke && smokeTicks==10) preview=por2::Shot{0,{260,389}};
+        renderer.draw(game, debug, grid, preview);
         const std::string nextTitle = game.finished()
             ? "Por2D - Completed! R: play again | Esc: menu | F11: fullscreen"
             : "Por2D - " + game.level().name + " | Esc: levels  F11: fullscreen | WASD: move/jump  G: gravity  E: exit  R: restart";
@@ -265,6 +275,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
     }
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
+        app->previewPortal = message == WM_LBUTTONDOWN ? 0 : 1;
         app->mousePressed[message == WM_LBUTTONDOWN ? 0 : 1] = true;
         SetCapture(window);
         return 0;
