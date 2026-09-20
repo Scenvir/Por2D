@@ -59,7 +59,35 @@
     for(let y=Math.min(a.y,b.y);y<=Math.max(a.y,b.y);y++)
       for(let x=Math.min(a.x,b.x);x<=Math.max(a.x,b.x);x++)m.tiles[y][x]=tile;
   }
-  const api = {W,H,TILE,blank,parse,bounds,validate,cpp,fillRectangle};
+  function selectRectangle(m,a,b) {
+    const x=Math.min(a.x,b.x), y=Math.min(a.y,b.y);
+    const right=Math.max(a.x,b.x)+1, bottom=Math.max(a.y,b.y)+1;
+    const selection={tiles:[], bodies:[]};
+    for(let row=y;row<bottom;row++)for(let col=x;col<right;col++)
+      if(m.tiles[row][col])selection.tiles.push({x:col,y:row});
+    for(const key of ['spawn','exit'])if(m[key]){
+      const r=bounds(m[key]);
+      if(r.x<right*TILE&&r.x+r.w>x*TILE&&r.y<bottom*TILE&&r.y+r.h>y*TILE)selection.bodies.push(key);
+    }
+    return selection;
+  }
+  function moveSelection(m,s,dx,dy) {
+    if(!Number.isInteger(dx)||!Number.isInteger(dy))return null;
+    const next=parse(JSON.stringify(m));
+    for(const c of s.tiles)next.tiles[c.y][c.x]=0;
+    for(const c of s.tiles){
+      const x=c.x+dx,y=c.y+dy;
+      if(x<0||x>=W||y<0||y>=H||next.tiles[y][x])return null;
+    }
+    for(const key of s.bodies){
+      next[key].x+=dx;next[key].y+=dy;
+      const r=bounds(next[key]);
+      if(r.x<0||r.y<0||r.x+r.w>W*TILE||r.y+r.h>H*TILE)return null;
+    }
+    for(const c of s.tiles)next.tiles[c.y+dy][c.x+dx]=m.tiles[c.y][c.x];
+    return {map:next,selection:{tiles:s.tiles.map(c=>({x:c.x+dx,y:c.y+dy})),bodies:s.bodies.slice()}};
+  }
+  const api = {W,H,TILE,blank,parse,bounds,validate,cpp,fillRectangle,selectRectangle,moveSelection};
   if (typeof module !== 'undefined') module.exports = api;
   else root.MapModel = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
