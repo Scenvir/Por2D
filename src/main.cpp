@@ -5,10 +5,13 @@
 #include <commdlg.h>
 #include "por2/replay.hpp"
 #include "por2/render.hpp"
+#include "por2/tutorial.hpp"
 #include <iostream>
 #include <string>
 #include <algorithm>
 #include <fstream>
+#include <cwctype>
+#include <cwchar>
 #include <random>
 
 namespace {
@@ -34,6 +37,36 @@ std::optional<por2::Vec2> logicalPoint(HWND window, int x, int y) {
 }
 RECT card(int slot) { return {60+(slot%3)*300, 140+(slot/3)*64, 340+(slot%3)*300, 192+(slot/3)*64}; }
 bool contains(RECT r, por2::Vec2 p) { return p.x>=r.left && p.x<r.right && p.y>=r.top && p.y<r.bottom; }
+RECT menuRow(int row) { return {310,170+row*72,690,228+row*72}; }
+RECT menuButton(int item){if(item<3)return menuRow(item);if(item==3)return menuRow(4);return item==4?RECT{310,386,495,444}:RECT{505,386,690,444};}
+RECT bindingRow(int row) { return {190,100+row*40,810,136+row*40}; }
+constexpr RECT SpeedButton{190,430,490,474};
+constexpr RECT FullscreenButton{510,430,810,474};
+constexpr RECT ReplayUiButton{735,12,920,48};
+constexpr RECT GearButton{936,10,986,62};
+constexpr RECT HelpButton{400,492,600,532};
+constexpr RECT ResetButton{190,492,390,532};
+constexpr RECT SettingsBack{610,492,810,532};
+constexpr RECT LessonPrevious{40,540,215,582}, LessonSettings{230,540,410,582}, LessonSkip{570,540,740,582}, LessonNext{755,540,960,582};
+constexpr RECT LessonPause{425,540,555,582};
+constexpr RECT LessonPractice{755,120,960,160}, CrownButton{350,536,650,568};
+const std::array<unsigned,8> DefaultBindings{'A','D','W','E','R','Q',VK_LBUTTON,VK_RBUTTON};
+const std::array<std::wstring,8> ActionNames{L"向左移动",L"向右移动",L"跳跃",L"进入出口",L"重新开始",L"切换落点预览",L"蓝色传送门",L"橙色传送门"};
+bool bindable(unsigned key, int action) {
+    if(key==VK_LBUTTON || key==VK_RBUTTON) return action>=6;
+    return (key>='A'&&key<='Z') || (key>='0'&&key<='9') || key==VK_SPACE ||
+        (key>=VK_LEFT&&key<=VK_DOWN) || (key>=VK_NUMPAD0&&key<=VK_DIVIDE) ||
+        (key>=VK_OEM_1&&key<=VK_OEM_3) || (key>=VK_OEM_4&&key<=VK_OEM_8);
+}
+std::wstring keyName(unsigned key) {
+    if(key==VK_LBUTTON)return L"鼠标左键";
+    if(key==VK_RBUTTON)return L"鼠标右键";
+    wchar_t text[64]{};
+    LONG scan=static_cast<LONG>(MapVirtualKeyW(key,MAPVK_VK_TO_VSC)<<16);
+    if(key>=VK_LEFT&&key<=VK_DOWN)scan|=1<<24;
+    if(GetKeyNameTextW(scan,text,64))return text;
+    return L"Key "+std::to_wstring(key);
+}
 void label(HDC dc, RECT r, const std::wstring& text, int size, COLORREF color) {
     HFONT font = CreateFontW(-size,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei");
@@ -44,23 +77,237 @@ void label(HDC dc, RECT r, const std::wstring& text, int size, COLORREF color) {
 void fill(HDC dc, RECT r, COLORREF color) {
     HBRUSH brush=CreateSolidBrush(color); FillRect(dc,&r,brush); DeleteObject(brush);
 }
+int paragraph(HDC dc,RECT area,const std::wstring& text,int size,COLORREF color,bool measure=false,const wchar_t* face=L"Microsoft YaHei"){
+    HFONT font=CreateFontW(-size,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,face);
+    auto old=SelectObject(dc,font);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,color);
+    DrawTextW(dc,text.c_str(),-1,&area,DT_LEFT|DT_WORDBREAK|DT_NOPREFIX|(measure?DT_CALCRECT:0));
+    SelectObject(dc,old);DeleteObject(font);return area.bottom-area.top;
+}
 struct Application {
     explicit Application(int level) : game(level), levels(por2::Campaign.begin(),por2::Campaign.end()) {
-        levels.push_back(1); levels.push_back(2); // Sandbox levels outside the campaign.
         auto found=std::find(levels.begin(),levels.end(),level);
         if(found!=levels.end()) selected=static_cast<int>(found-levels.begin());
     }
     por2::Game game;
     por2::Renderer renderer;
+    por2::Game demo{0};
+    std::mt19937 random{std::random_device{}()};
+    int demoTicks=0, demoMove=0;
     por2::Replay replay;
-    bool replaySlow=false, replaySingle=false, importing=false;
+    por2::Tutorial tutorial;
+    bool tutorialActive=false, tutorialPending=false, tutorialPaused=false;
+    bool tutorialPractice=false;
+    void togglePractice(){tutorialPractice=!tutorialPractice;tutorialPaused=false;clearInput();tutorial.aim.reset();if(!tutorialPractice)tutorial.reset(tutorial.stage);}
+    void finishTutorial(){tutorialActive=tutorialPending=false;clearInput();renderer.draw(game,debug,grid);}
+    void tutorialStep(int delta){
+        if(tutorial.stage+delta>=6){finishTutorial();return;}
+        tutorialPractice=false;tutorial.reset(std::clamp(tutorial.stage+delta,0,5));clearInput();
+        renderer.draw(tutorial.scene,true,true,tutorial.aim,false);
+    }
+    void drawGear(HDC dc) const {
+        fill(dc,GearButton,buttonColor(GearButton));
+        HPEN pen=CreatePen(PS_SOLID,2,RGB(220,233,250));auto old=SelectObject(dc,pen);auto brush=SelectObject(dc,GetStockObject(NULL_BRUSH));
+        Ellipse(dc,952,20,972,40);Ellipse(dc,958,26,966,34);
+        for(int i=0;i<8;++i){double a=i*3.141592653589793/4;MoveToEx(dc,962+static_cast<int>(10*std::cos(a)),30+static_cast<int>(10*std::sin(a)),nullptr);LineTo(dc,962+static_cast<int>(15*std::cos(a)),30+static_cast<int>(15*std::sin(a)));}
+        SelectObject(dc,brush);SelectObject(dc,old);DeleteObject(pen);label(dc,{936,43,986,61},L"菜单",12,RGB(220,233,250));
+    }
+    std::wstring helpText;
+    struct HelpBlock{std::wstring text;int size;bool code;};
+    std::vector<HelpBlock> helpBlocks;
+    int helpScroll=0;
+    mutable int helpHeight=0;
+    void openHelp(){
+        openMenu(Page::Help);helpScroll=0;
+        try{
+            wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
+            auto root=std::filesystem::path(executable).parent_path();if(root.filename()==L"build")root=root.parent_path();
+            std::ifstream file(root/L"新手教程.md",std::ios::binary);if(!file)throw std::runtime_error("missing tutorial");
+            std::string text((std::istreambuf_iterator<char>(file)),{});helpText=utf8(text);
+        }catch(const std::exception&){helpText=L"无法读取新手教程.md。请将教程文件与程序放在一起（开发版本放在项目目录）。";}
+        helpBlocks.clear();std::wistringstream lines(helpText);std::wstring line;bool code=false;
+        while(std::getline(lines,line)){
+            if(!line.empty()&&line.back()==L'\r')line.pop_back();
+            if(line.rfind(L"```",0)==0){code=!code;continue;}
+            if(code){helpBlocks.push_back({line.empty()?L" ":line,18,true});continue;}
+            if(line.empty()){helpBlocks.push_back({L" ",8,false});continue;}
+            int size=19;
+            if(line.front()==L'#'){const auto start=line.find_first_not_of(L"# ");line=start==std::wstring::npos?L" ":line.substr(start);size=25;}
+            if(line.front()==L'|'&&line.find_first_not_of(L"|-: \t")==std::wstring::npos)continue;
+            if(line.front()==L'|'){
+                line.erase(0,1);if(!line.empty()&&line.back()==L'|')line.pop_back();
+                std::size_t at=0;while((at=line.find(L'|',at))!=std::wstring::npos){line.replace(at,1,L" — ");at+=3;}
+            }
+            for(const auto* mark:{L"**",L"`"}){std::size_t at;while((at=line.find(mark))!=std::wstring::npos)line.erase(at,std::wcslen(mark));}
+            std::size_t at=0;
+            while((at=line.find(L'[',at))!=std::wstring::npos){const auto end=line.find(L"](",at),close=end==std::wstring::npos?end:line.find(L')',end+2);if(end==std::wstring::npos||close==std::wstring::npos)break;const auto text=line.substr(at+1,end-at-1);line.replace(at,close-at+1,text);at+=text.size();}
+            helpBlocks.push_back({line,size,false});
+        }
+    }
+    void scrollHelp(int amount){helpScroll=std::clamp(helpScroll+amount,0,std::max(0,helpHeight-400));}
+    void drawHelp(HDC dc) const {
+        fill(dc,{0,0,1000,600},RGB(15,21,34));label(dc,{40,20,960,78},L"帮助 / 新手教程",32,RGB(240,245,255));
+        const int saved=SaveDC(dc);IntersectClipRect(dc,45,100,935,500);
+        int offset=0;
+        for(const auto& block:helpBlocks){
+            const auto font=block.code?L"Consolas":L"Microsoft YaHei";
+            const int height=paragraph(dc,{55,0,925,0},block.text,block.size,RGB(220,230,245),true,font);
+            const int y=100+offset-helpScroll;
+            if(y+height>=100&&y<500)paragraph(dc,{55,y,925,y+height},block.text,block.size,block.size>19?RGB(130,194,255):RGB(220,230,245),false,font);
+            offset+=height+(block.code?0:7);
+        }
+        helpHeight=offset;RestoreDC(dc,saved);
+        fill(dc,{950,100,958,500},RGB(45,58,76));
+        const int thumb=std::max(20,400*400/std::max(400,helpHeight));
+        const int y=100+(400-thumb)*helpScroll/std::max(1,helpHeight-400);fill(dc,{950,y,958,y+thumb},RGB(90,170,225));
+        label(dc,{40,502,960,538},L"鼠标滚轮 / ↑ ↓ 滚动 · PageUp / PageDown 翻页 · Home / End",16,RGB(150,173,201));
+        fill(dc,{375,545,625,585},buttonColor({375,545,625,585}));label(dc,{375,545,625,585},L"返回设置 (Esc)",20,RGB(240,245,255));
+    }
+    void drawTutorial(HDC dc) const {
+        const auto& t=tutorial;
+        const std::array<std::wstring,6> titles{L"键位与移动",L"哪些墙可以射门？",L"必须击中三格的中间格",L"头朝向决定门朝向",L"门朝向与传送对应关系",L"跨门时的锁定与换门"};
+        fill(dc,{0,0,1000,112},RGB(15,21,34));
+        label(dc,{30,10,910,48},L"新手教学  "+std::to_wstring(t.stage+1)+L" / 6 · "+titles[t.stage],27,RGB(240,245,255));
+        std::wstring detail;
+        if(t.stage==0)detail=L"身体按屏幕方向移动。点击下方“键位设置”可改键；返回菜单后继续教学。";
+        if(t.stage==1)detail=t.phase==0?L"白色墙：连续三格可放门，绿色射线与箭头表示当前可以放置。":L"深灰墙：不能放门。红色射线和叉号表示放置失败。";
+        if(t.stage==2)detail=t.phase==1?L"命中第 2 格：它是连续三格的中间，能够放门。":L"命中边上的格子：不会自动吸附到中间，三格墙段容不下新门，放置失败。";
+        if(t.stage==3)detail=L"红点是角色头部；同一面墙、同一目标，改变头朝向会改变门的渐变和箭头方向。";
+        if(t.stage==4)detail=t.phase==2?L"蓝门与橙门朝向相反，仍然亮对亮、暗对暗。角色从蓝门进入、橙门出来后，头朝下了。":L"传送始终亮对亮、暗对暗；观察两端标记和跨门的身体。红点标出角色头部。";
+        if(t.stage==5)detail=t.phase==0?L"身体较大的一侧锁定（金框）。尝试移动这扇门会失败，原门保持不变。":t.phase==1?L"身体较小的一侧可以换门：射击后，另一端露出的身体也移动到新的门口。":L"继续穿过门，观察金框随本体侧变化；完全离开后解除锁定。";
+        paragraph(dc,{40,58,900,106},detail,18,RGB(176,201,227));
+        if(t.stage==0){
+            const std::array<bool,3> pressed{t.movement.left,t.movement.right,t.movement.jump};
+            for(int i=0;i<3;++i){RECT r{365+i*90,160,440+i*90,206};fill(dc,r,pressed[i]?RGB(35,110,174):RGB(31,43,61));label(dc,r,keyName(bindings[i]),22,RGB(240,245,255));}
+            label(dc,{280,215,730,247},L"演示按键：左移 / 右移 / 跳跃",17,RGB(180,200,225));
+        }
+        if(t.stage==2){
+            for(int i=0;i<3;++i)label(dc,{185,300+i*20,235,320+i*20},std::to_wstring(i+1),17,i==t.phase?RGB(255,215,100):RGB(170,180,200));
+        }
+        if(t.stage==3)label(dc,{360,220,690,255},L"当前头朝"+std::array<std::wstring,4>{L"上",L"右",L"下",L"左"}[t.phase],23,RGB(255,215,100));
+        if(t.stage==4){
+            label(dc,{260,220,740,255},t.phase==0?L"同向门：头朝上":t.phase==1?L"同向门：头朝下":L"反向蓝门 → 橙门：角色倒过来了",23,RGB(255,215,100));
+            const auto& portals=t.scene.portals();
+            if(portals[0].active()&&portals[1].active())for(int end=0;end<2;++end){
+                const auto a=por2::decode(portals[0]);
+                const auto source=a.anchor+a.tangent*(end==0?8:52);
+                const auto target=por2::transformPoint(source,portals[0],portals[1]);
+                const auto color=end==0?RGB(145,165,195):RGB(255,239,170);
+                for(int i=0;i<2;++i){
+                    const auto p=i==0?source:target;
+                    const LONG x=static_cast<LONG>(p.x)+(i==0?-70:15),y=static_cast<LONG>(p.y);
+                    label(dc,{x,y-13,x+55,y+13},end==0?L"暗端":L"亮端",18,color);
+                }
+                const auto p=source+(target-source)*((t.frame%120)/119.0);
+                fill(dc,{static_cast<LONG>(p.x)-4,static_cast<LONG>(p.y)-4,static_cast<LONG>(p.x)+5,static_cast<LONG>(p.y)+5},color);
+            }
+        }
+        if(t.stage==5){
+            const auto& view=t.scene.traversal();const double total=view.bodyAreas[0]+view.bodyAreas[1];
+            for(int i=0;i<2;++i){
+                const RECT area=i==0?RECT{10,250,230,310}:RECT{765,310,995,370};
+                const auto share=total>0?std::to_wstring(static_cast<int>(std::lround(view.bodyAreas[i]*100/total)))+L"%":L"";
+                paragraph(dc,area,(i==0?L"蓝门 ":L"橙门 ")+share+(view.lockedPortal==i?L"\n金框：当前锁定":L"\n未锁定"),18,i==0?RGB(80,175,255):RGB(255,170,80));
+            }
+        }
+        if(t.aim&&!tutorialPractice){
+            const auto hit=por2::castShot(t.scene.level().map,t.scene.traversal().aimOrigin,t.aim->target);
+            if(hit){
+                const auto p=t.scene.traversal().aimOrigin+(hit->point-t.scene.traversal().aimOrigin)*((t.frame%60)/60.0);
+                fill(dc,{static_cast<LONG>(p.x)-2,static_cast<LONG>(p.y)-2,static_cast<LONG>(p.x)+3,static_cast<LONG>(p.y)+3},RGB(255,220,120));
+            }
+        }
+        fill(dc,{0,450,1000,600},RGB(15,21,34));
+        fill(dc,LessonPractice,buttonColor(LessonPractice));
+        label(dc,LessonPractice,tutorialPractice?L"返回自动演示":L"亲自试试",19,RGB(240,245,255));
+        std::wstring outcome=t.stage==0?L"射门："+keyName(bindings[6])+L" / "+keyName(bindings[7])+L" · 交互："+keyName(bindings[3])+L" · 重开："+keyName(bindings[4]):t.attempted?(t.accepted?L"实际射击结果：放置成功":L"实际射击结果：放置失败，原门保留"):L"观察预览，随后自动尝试射击";
+        if(t.stage==4)outcome=L"亮对亮，暗对暗 · 移动标记表示对应位置，身体按真实传送规则映射";
+        if(tutorialPractice)outcome=L"自由练习：使用当前键位"+std::wstring(t.attempted?(t.accepted?L" · 射门成功":L" · 射门失败，原门保留"):L" · 移动、跳跃、射门或重开");
+        label(dc,{30,458,970,493},outcome,21,RGB(255,215,100));
+        label(dc,{30,498,970,527},tutorialPractice?L"点击下方按钮暂停或换段 · 返回自动演示会重置本段 · 不影响正式关卡":L"实时演示循环播放 · 空格 / → 下一段 · ← 上一段 · 教学不会改变关卡进度",16,RGB(150,173,201));
+        for(const auto r:{LessonPrevious,LessonSettings,LessonPause,LessonSkip,LessonNext})fill(dc,r,buttonColor(r));
+        label(dc,LessonPause,tutorialPaused?L"继续 (P)":L"暂停 (P)",19,RGB(240,245,255));
+        label(dc,LessonPrevious,L"上一段",19,RGB(240,245,255));label(dc,LessonSettings,L"键位设置",19,RGB(240,245,255));
+        label(dc,LessonSkip,L"跳过教学",19,RGB(240,245,255));label(dc,LessonNext,t.stage==5?L"开始 Level 0":L"下一段",19,RGB(240,245,255));
+    }
+    std::vector<por2::Level> customLevels;
+    std::wstring mapWarnings;
+    por2::Level levelById(int id) const {
+        for(const auto& level:customLevels)if(level.id==id)return level;
+        return por2::makeLevel(id);
+    }
+    por2::Game newGame(int id) const {const auto level=levelById(id);return level.editorJson.empty()?por2::Game(id):por2::Game(level);}
+    void loadMaps(){
+        wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
+        const auto folder=std::filesystem::path(executable).parent_path();
+        // Development builds share the project's levels folder; packaged builds use one beside the executable.
+        const auto directory=folder.filename()==L"build"?folder.parent_path()/L"levels":folder/L"levels";
+        try{
+            std::filesystem::create_directories(directory);
+            std::vector<std::filesystem::path> paths;
+            for(const auto& entry:std::filesystem::directory_iterator(directory)){
+                auto extension=entry.path().extension().wstring();std::transform(extension.begin(),extension.end(),extension.begin(),::towlower);
+                if(entry.is_regular_file()&&extension==L".json")paths.push_back(entry.path());
+            }
+            std::sort(paths.begin(),paths.end());
+            for(const auto& path:paths){try{const int id=1000+static_cast<int>(customLevels.size());customLevels.push_back(por2::loadEditorLevel(path,id));levels.push_back(id);}
+                catch(const std::exception& error){mapWarnings+=path.filename().wstring()+L": "+utf8(error.what())+L"\n";}}
+        }catch(const std::exception& error){mapWarnings+=utf8(error.what());}
+    }
+    bool replaySingle=false, importing=false;
+    bool replayUiHidden=false;
+    int speedTenths=10, gameClock=0;
+    bool logicDue(int& clock) const {clock+=speedTenths;if(clock<10)return false;clock-=10;return true;}
+    std::wstring speedText() const {
+        return speedTenths==10?L"1.0×":L"0."+std::to_wstring(speedTenths)+L"×";
+    }
+    por2::Recorder recorder;
+    std::wstring recordingMessage;
+    std::filesystem::path lastRecordingPath;
+    bool stopRecording() {
+        if(recorder.active&&!recorder.pending)recordingMessage=L"录制已停止：尚未推进逻辑帧，未生成文件。";
+        recorder.active=false;
+        if(!recorder.pending)return true;
+        if(smoke){recorder.pending=false;return true;}
+        try {
+            const auto directory=bindingsPath.parent_path()/L"recordings";
+            std::filesystem::create_directories(directory);
+            const auto entry=std::find(por2::Campaign.begin(),por2::Campaign.end(),recorder.script.level);
+            const auto name=recorder.script.customLevel?L"custom":entry!=por2::Campaign.end()?L"level-"+std::to_wstring(entry-por2::Campaign.begin()):L"experimental-"+std::to_wstring(recorder.script.level);
+            const auto path=directory/(name+L"-"+std::to_wstring(GetTickCount64())+L".txt");
+            std::ofstream output(path);output<<recorder.text();output.close();
+            if(!output)throw std::runtime_error("Cannot write recording");
+            lastRecordingPath=path;
+            recorder.pending=false;recordingMessage=L"录制已保存：recordings/"+path.filename().wstring();
+            return true;
+        }catch(const std::exception&){
+            recordingMessage=L"录制保存失败，数据仍保留；按 F10 重试。";
+            MessageBoxW(nullptr,recordingMessage.c_str(),L"录制保存失败",MB_OK|MB_ICONERROR);return false;
+        }
+    }
+    void toggleRecording() {
+        if(recorder.active||recorder.pending){stopRecording();return;}
+        if(replay.active){recordingMessage=L"请先按 F7 退出回放，再开始录制。";return;}
+        if(!started)return;
+        game=game.level().editorJson.empty()?por2::Game(game.level().id):por2::Game(game.level());recorder.start(game.level());
+        intro=false;menu=false;tutorialPending=tutorialActive=false;endLevelIntro();gameClock=0;
+        recordingMessage=L"录制中 · F10 停止并保存";
+        renderer.draw(game,debug,grid);
+    }
+    bool hideReplayUi() const { return replay.active&&replayUiHidden; }
+    void toggleReplayUi(HWND window) {
+        replayUiHidden=!replayUiHidden;
+        renderer.draw(game,debug,grid&&!hideReplayUi());
+        InvalidateRect(window,nullptr,FALSE);
+    }
     int replayClock=0, aimTicks=0;
     std::optional<por2::Shot> replayAim;
     void startReplay(por2::ReplayScript script) {
+        if(!stopRecording())throw std::runtime_error("Save the pending recording before importing a replay");
+        if(!script.customLevel&&script.level<0&&menu)game=newGame(levels[selected]);
         replay.start(std::move(script),menu?levels[selected]:game.level().id,game);
-        intro=false; menu=false; started=true; endLevelIntro();
+        intro=false; menu=false; started=true; tutorialPending=tutorialActive=false;endLevelIntro();
         replayClock=aimTicks=0; replaySingle=false; replayAim.reset();
-        renderer.draw(game,debug,grid);
+        renderer.draw(game,debug,grid&&!hideReplayUi());
     }
     void importReplay(HWND window) {
         const bool wasPaused=replay.paused;
@@ -82,6 +329,9 @@ struct Application {
     }
     void drawReplay(HDC dc) const {
         if (!replay.active) return;
+        fill(dc,ReplayUiButton,buttonColor(ReplayUiButton));
+        label(dc,ReplayUiButton,replayUiHidden?L"显示 UI (F9)":L"隐藏 UI (F9)",18,RGB(240,245,255));
+        if(replayUiHidden)return;
         if (replayAim && aimTicks>0) {
             const int x=static_cast<int>(std::clamp(replayAim->target.x,0.0,999.0));
             const int y=static_cast<int>(std::clamp(replayAim->target.y,0.0,599.0));
@@ -94,13 +344,15 @@ struct Application {
         fill(dc,{10,465,990,544},RGB(15,21,34));
         const std::wstring state=replay.completed?(replay.cleared?L"过关成功":L"脚本结束（未过关）"):(replay.paused?L"已暂停":L"播放中");
         const std::wstring command=replay.lastAction<0?L"准备开始":utf8(replay.script.actions[replay.lastAction].text);
-        label(dc,{15,467,985,493},state+L"  "+(replaySlow?L"0.25×":L"1×")+L"  帧 "+
+        const std::wstring rate=speedText();
+        label(dc,{15,467,985,493},state+L"  "+rate+L"  帧 "+
             std::to_wstring(replay.frame)+L"/"+std::to_wstring(replay.script.totalFrames)+L"  当前: "+command,18,RGB(240,245,255));
-        label(dc,{15,494,985,520},L"空格 暂停/继续 · . 单帧 · R 重播 · F8 慢速 · F7 退出 · F6 导入",17,RGB(150,195,230));
+        label(dc,{15,494,985,520},L"空格 暂停/继续 · . 单帧 · R 重播 · F7 退出 · F6 导入 · F9 显示 UI",17,RGB(150,195,230));
         fill(dc,{20,532,980,538},RGB(45,58,76));
         fill(dc,{20,532,20+960*replay.frame/replay.script.totalFrames,538},RGB(80,185,235));
     }
     std::array<bool, 256> keys{};
+    int gravityTurns=0;
     std::array<bool, 2> mousePressed{};
     std::vector<por2::Shot> shots;
     bool debug = true;
@@ -108,7 +360,6 @@ struct Application {
     int previewPortal = 0;
     bool previewEnabled = true;
     bool exitPressed = false;
-    int gravityTurns = 0;
     std::string title;
     bool smoke = false;
     int smokeTicks = 0;
@@ -118,13 +369,97 @@ struct Application {
     std::vector<int> levels;
     int selected=0;
     bool menu=true, started=false, fullscreen=false;
+    enum class Page { Main, Levels, Settings, Help };
+    Page page=Page::Main;
+    int menuItem=0, settingItem=0, rebinding=-1;
+    std::optional<por2::Vec2> menuPointer;
+    bool mouseNavigation=false;
+    COLORREF buttonColor(RECT rect, bool keyboardSelected=false) const {
+        const bool active=mouseNavigation?(menuPointer&&contains(rect,*menuPointer)):keyboardSelected;
+        return active?RGB(35,110,174):RGB(31,43,61);
+    }
+    COLORREF levelTextColor(int index) const {
+        const bool current=game.level().editorJson.empty()?levels[index]==game.level().id:levelById(levels[index]).editorJson==game.level().editorJson;
+        return started&&current?RGB(139,157,183):RGB(240,245,255);
+    }
+    std::array<unsigned,8> bindings=DefaultBindings;
+    std::wstring settingsMessage=L"选择操作后按新键；Esc 取消改键。重复键位会提示冲突。";
+    std::filesystem::path bindingsPath;
+    void loadBindings(const std::filesystem::path& path={}) {
+        wchar_t executable[32768]{};
+        GetModuleFileNameW(nullptr,executable,32768);
+        bindingsPath=path.empty()?std::filesystem::path(executable).parent_path()/L"keybindings.ini":path;
+        std::ifstream file(bindingsPath);
+        auto candidate=DefaultBindings;
+        for(int i=0;i<8;++i) {
+            if(!(file>>candidate[i]) || !bindable(candidate[i],i))return;
+            for(int j=0;j<i;++j)if(candidate[i]==candidate[j])return;
+        }
+        bindings=candidate;
+        std::string speedTag;int savedSpeed=10;
+        if(file>>speedTag>>savedSpeed && speedTag=="speedTenths" && savedSpeed>=1 && savedSpeed<=10)speedTenths=savedSpeed;
+        int value;while(file>>speedTag>>value){if(speedTag=="crownUnlocked")renderer.crownUnlocked=value==1;if(speedTag=="crownVisible")renderer.crownVisible=value==1;}
+    }
+    void saveBindings() {
+        if(smoke)return;
+        std::ofstream file(bindingsPath);
+        for(auto key:bindings)file<<key<<'\n';
+        file<<"speedTenths "<<speedTenths<<'\n';
+        file<<"crownUnlocked "<<renderer.crownUnlocked<<'\n'<<"crownVisible "<<renderer.crownVisible<<'\n';
+        file.close();
+        if(!file)settingsMessage=L"键位已生效，但无法写入 keybindings.ini；请检查游戏目录写入权限。";
+    }
+    void assignBinding(unsigned key) {
+        if(rebinding<0)return;
+        if(!bindable(key,rebinding)){settingsMessage=L"该按键保留给菜单或系统，请选择字母、数字、方向键或空格等按键。";return;}
+        for(int i=0;i<8;++i)if(i!=rebinding&&bindings[i]==key){settingsMessage=L"该按键已用于「"+ActionNames[i]+L"」，请先更改该操作。";return;}
+        bindings[rebinding]=key;rebinding=-1;clearInput();
+        settingsMessage=L"键位已保存。";saveBindings();
+    }
+    void openMenu(Page next=Page::Main) {
+        menu=true;page=next;rebinding=-1;clearInput();
+        if(next==Page::Levels && started){
+            const auto current=std::find_if(levels.begin(),levels.end(),[&](int id){return game.level().editorJson.empty()?id==game.level().id:levelById(id).editorJson==game.level().editorJson;});
+            if(current!=levels.end())selected=static_cast<int>(current-levels.begin());
+        }
+    }
+    void resume() { if(started){menu=false;clearInput();} }
+    void back() {
+        if(rebinding>=0){rebinding=-1;settingsMessage=L"已取消改键。";}
+        else if(page==Page::Help)openMenu(Page::Settings);
+        else if(page!=Page::Main)openMenu();
+        else resume();
+    }
+    void activateMenu(HWND window) {
+        if(menuItem==0){if(started)resume();else openMenu(Page::Levels);}
+        if(menuItem==1)openMenu(Page::Settings);
+        if(menuItem==2)openMenu(Page::Levels);
+        if(menuItem==3&&stopRecording())DestroyWindow(window);
+        if(menuItem==4)toggleRecording();
+        if(menuItem==5)importReplay(window);
+    }
+    void activateSetting(HWND window=nullptr) {
+        if(settingItem<8){rebinding=settingItem;settingsMessage=L"请按新键（传送门也可使用鼠标左右键）；Esc 取消。";}
+        else if(settingItem==8){bindings=DefaultBindings;settingsMessage=L"已恢复默认键位。";saveBindings();clearInput();}
+        else if(settingItem==10){
+            speedTenths=speedTenths%10+1;gameClock=replayClock=0;
+            settingsMessage=L"运行速度："+speedText()+L"；每个逻辑帧保持不变。";saveBindings();
+        }
+        else if(settingItem==11&&window)toggleFullscreen(window);
+        else if(settingItem==12)openHelp();
+        else if(settingItem==13){renderer.crownVisible=!renderer.crownVisible;saveBindings();}
+        else back();
+    }
     bool intro=true;
     static constexpr int LevelIntroDuration=150;
     int levelIntroTicks=-1;
     unsigned suppressedKey=256;
     bool levelIntroActive() const { return levelIntroTicks>=0; }
-    void beginLevelIntro() { levelIntroTicks=0; clearInput(); }
-    void endLevelIntro() { levelIntroTicks=-1; clearInput(); }
+    void beginLevelIntro() { levelIntroTicks=0;tutorialActive=false;tutorialPending=game.level().id==0&&game.level().editorJson.empty()&&!replay.active&&!recorder.active;clearInput(); }
+    void endLevelIntro() {
+        levelIntroTicks=-1;clearInput();
+        if(tutorialPending){tutorialPending=false;tutorialActive=true;tutorialPaused=false;tutorialPractice=false;tutorial.reset(0);renderer.draw(tutorial.scene,true,true);}
+    }
     void stepLevelIntro() {
         if (levelIntroActive() && ++levelIntroTicks>=LevelIntroDuration) endLevelIntro();
     }
@@ -138,16 +473,20 @@ struct Application {
         };
         const auto entry=std::find(levels.begin(),levels.end(),game.level().id);
         const int offset=static_cast<int>((1-alpha)*12);
-        label(dc,{80,155+offset,920,205+offset},L"level "+std::to_wstring(entry-levels.begin()),24,tint(130,194,255));
+        label(dc,{80,155+offset,920,205+offset},game.level().editorJson.empty()?L"level "+std::to_wstring(entry-levels.begin()):L"自定义关卡",24,tint(130,194,255));
         label(dc,{60,215+offset,940,295+offset},utf8(game.level().name),52,tint(240,245,255));
         fill(dc,{450,314,550,316},tint(255,215,100));
         label(dc,{40,335+offset,960,390+offset},utf8(game.level().commentary),24,tint(190,205,225));
         label(dc,{60,505,940,550},L"按任意键跳过",17,tint(139,157,183));
     }
-    por2::Game demo{0};
-    std::mt19937 random{std::random_device{}()};
-    int demoTicks=0, demoMove=0;
-    void leaveIntro() { intro=false; menu=true; clearInput(); }
+    void leaveIntro() { intro=false; openMenu(); }
+    void drawIntro(HDC dc) const {
+        fill(dc,{310,30,690,135},RGB(15,21,34));
+        label(dc,{310,35,690,125},L"Por2D",68,RGB(235,242,255));
+        fill(dc,{250,470,750,570},RGB(15,21,34));
+        label(dc,{250,475,750,525},L"按空格跳过",30,RGB(255,215,100));
+        label(dc,{250,530,750,565},L"Level 0 配有实时新手教学",18,RGB(150,173,201));
+    }
     void updateDemo() {
         por2::InputFrame input;
         if (demoTicks % 30 == 0) demoMove=static_cast<int>(random()%3)-1;
@@ -159,16 +498,16 @@ struct Application {
         demo.tick(input);
         renderer.draw(demo,false,false);
     }
-    void drawIntro(HDC dc) const {
-        fill(dc,{310,35,690,135},RGB(15,21,34));
-        label(dc,{310,40,690,100},L"Por2D",48,RGB(235,242,255));
-        label(dc,{310,100,690,130},L"PORTAL / LEVEL 0",16,RGB(150,173,201));
-        fill(dc,{250,465,750,545},RGB(15,21,34));
-        label(dc,{250,475,750,535},L"按任意键开始",28,RGB(255,215,100));
-    }
     WINDOWPLACEMENT placement{};
     LONG_PTR savedStyle=0;
     void clearInput() { keys={}; mousePressed={}; shots.clear(); exitPressed=false; gravityTurns=0; ReleaseCapture(); }
+    void keyboardShot(HWND window, int portal) {
+        POINT cursor{};
+        if(GetCursorPos(&cursor)&&ScreenToClient(window,&cursor)){
+            const auto point=logicalPoint(window,cursor.x,cursor.y);
+            if(point){previewPortal=portal;shots.push_back({portal,*point});}
+        }
+    }
     void toggleFullscreen(HWND window) {
         clearInput();
         if (!fullscreen) {
@@ -189,38 +528,79 @@ struct Application {
         fullscreen=!fullscreen; InvalidateRect(window,nullptr,FALSE);
     }
     void startSelected() {
+        if(!stopRecording())return;
         replay.active=false;
-        game=por2::Game(levels[selected]); menu=false; started=true; clearInput();
+        game=newGame(levels[selected]); menu=false; started=true; clearInput();
         beginLevelIntro();
         renderer.draw(game,debug,grid);
     }
     void menuClick(HWND window, por2::Vec2 point) {
+        if(page==Page::Help){if(contains({375,545,625,585},point))back();return;}
+        if(page==Page::Main){for(int i=0;i<6;++i)if(contains(menuButton(i),point)){menuItem=i;activateMenu(window);return;}return;}
+        if(page==Page::Settings){
+            for(int i=0;i<8;++i)if(contains(bindingRow(i),point)){settingItem=i;activateSetting();return;}
+            if(contains(SpeedButton,point)){settingItem=10;activateSetting();return;}
+            if(contains(FullscreenButton,point)){settingItem=11;activateSetting(window);return;}
+            if(contains(ResetButton,point)){settingItem=8;activateSetting();}
+            if(contains(HelpButton,point)){settingItem=12;activateSetting();}
+            if(contains(SettingsBack,point))back();
+            if(contains(CrownButton,point)){settingItem=13;activateSetting();}
+            return;
+        }
         const int first=(selected/15)*15;
         for(int i=first;i<std::min(first+15,static_cast<int>(levels.size()));++i)
             if(contains(card(i-first),point)) { selected=i; startSelected(); return; }
-        if(contains({60,480,240,526},point)) selected=selected>=15?selected-15:static_cast<int>(levels.size())-1;
-        else if(contains({260,480,440,526},point)) selected=(first+15)%levels.size();
-        else if(contains({460,480,640,526},point) && started) { menu=false; clearInput(); }
-        else if(contains({660,480,840,526},point)) toggleFullscreen(window);
-        else if(contains({850,480,950,526},point)) DestroyWindow(window);
+        if(contains({210,480,390,526},point)) selected=selected>=15?selected-15:static_cast<int>(levels.size())-1;
+        else if(contains({410,480,590,526},point)) selected=(first+15)%levels.size();
+        else if(contains({610,480,790,526},point)) openMenu();
     }
     void drawMenu(HDC dc) const {
+        if(page==Page::Help){drawHelp(dc);return;}
         fill(dc,{0,0,1000,600},RGB(15,21,34));
+        if(page==Page::Main){
+            label(dc,{60,35,940,100},started?L"游戏已暂停":L"Por2D / 主菜单",38,RGB(235,242,255));
+            if(started)label(dc,{60,105,940,145},utf8(game.level().name),22,RGB(150,173,201));
+            const std::array<std::wstring,6> items{started?L"继续游戏":L"开始游戏",L"设置",L"关卡选择",L"退出游戏",recorder.active||recorder.pending?L"停止录制 (F10)":L"录制 (F10)",L"回放 (F6)"};
+            for(int i=0;i<6;++i){
+                const bool disabled=i==4&&!started;
+                fill(dc,menuButton(i),disabled?RGB(25,33,46):buttonColor(menuButton(i),i==menuItem));
+                label(dc,menuButton(i),items[i],i>=4?21:25,disabled?RGB(100,112,128):RGB(240,245,255));
+            }
+            label(dc,{20,540,980,580},recordingMessage.empty()?L"录制从本关起点开始 · 回放可导入操作脚本":recordingMessage,17,RGB(150,173,201));return;
+        }
+        if(page==Page::Settings){
+            label(dc,{60,20,940,75},L"设置",34,RGB(235,242,255));
+            for(int i=0;i<8;++i){fill(dc,bindingRow(i),buttonColor(bindingRow(i),i==settingItem));label(dc,bindingRow(i),ActionNames[i]+L"    "+(rebinding==i?L"[ 等待输入… ]":keyName(bindings[i])),21,RGB(240,245,255));}
+            fill(dc,ResetButton,buttonColor(ResetButton,settingItem==8));
+            fill(dc,SpeedButton,buttonColor(SpeedButton,settingItem==10));
+            label(dc,SpeedButton,L"运行速度："+speedText(),21,RGB(240,245,255));
+            fill(dc,FullscreenButton,buttonColor(FullscreenButton,settingItem==11));
+            label(dc,FullscreenButton,fullscreen?L"全屏：开（切换窗口）":L"全屏：关（切换全屏）",20,RGB(240,245,255));
+            fill(dc,SettingsBack,buttonColor(SettingsBack,settingItem==9));
+            fill(dc,HelpButton,buttonColor(HelpButton,settingItem==12));
+            label(dc,ResetButton,L"恢复默认",21,RGB(240,245,255));label(dc,SettingsBack,L"返回菜单 (Esc)",19,RGB(240,245,255));
+            label(dc,HelpButton,L"帮助 / 新手教程",19,RGB(240,245,255));
+            fill(dc,CrownButton,buttonColor(CrownButton,settingItem==13));
+            label(dc,CrownButton,renderer.crownVisible?L"皇冠：显示（通关 Level 14 解锁）":L"皇冠：隐藏",16,RGB(240,245,255));
+            label(dc,{20,570,980,599},settingsMessage,14,RGB(255,215,100));return;
+        }
         label(dc,{60,25,940,82},L"Por2D  /  选择关卡",36,RGB(235,242,255));
-        label(dc,{60,85,940,120},L"点击关卡开始  ·  方向键 / Enter 开始  ·  F6 导入脚本  ·  F11 全屏",18,RGB(150,173,201));
+        label(dc,{60,85,940,120},L"点击关卡开始  ·  方向键 / Enter 开始  ·  F6 导入脚本",18,RGB(150,173,201));
         const int first=(selected/15)*15;
         for(int i=first;i<std::min(first+15,static_cast<int>(levels.size()));++i) {
-            RECT r=card(i-first); fill(dc,r,i==selected?RGB(35,110,174):RGB(31,43,61));
-            const auto name=por2::makeLevel(levels[i]).name;
-            const std::wstring caption=L"Level "+std::to_wstring(i)+L"  "+utf8(name);
-            label(dc,r,caption,20,RGB(240,245,255));
+            RECT r=card(i-first); fill(dc,r,buttonColor(r,i==selected));
+            const auto level=levelById(levels[i]);
+            const bool campaign=i<static_cast<int>(por2::Campaign.size());
+            const std::wstring prefix=campaign?L"Level "+std::to_wstring(i)+L"  ":L"自定义  ";
+            const std::wstring caption=(level.editorJson.empty()?prefix:L"自定义  ")+utf8(level.name);
+            label(dc,r,caption,20,levelTextColor(i));
         }
-        label(dc,{60,480,240,526},L"上一页",20,RGB(130,194,255));
-        label(dc,{260,480,440,526},L"下一页",20,RGB(130,194,255));
-        label(dc,{460,480,640,526},started?L"继续游戏 (Esc)":L"请选择关卡",20,RGB(210,221,238));
-        label(dc,{660,480,840,526},fullscreen?L"切换窗口":L"切换全屏",20,RGB(255,183,100));
-        label(dc,{850,480,950,526},L"退出",20,RGB(210,221,238));
-        label(dc,{60,540,940,580},L"第 "+std::to_wstring(selected/15+1)+L" / "+std::to_wstring((levels.size()+14)/15)+L" 页  ·  按战役顺序排列，末尾为实验地图",17,RGB(139,157,183));
+        for(const RECT r : {RECT{210,480,390,526},RECT{410,480,590,526},RECT{610,480,790,526}})
+            fill(dc,r,buttonColor(r));
+        label(dc,{210,480,390,526},L"上一页",20,RGB(130,194,255));
+        label(dc,{410,480,590,526},L"下一页",20,RGB(130,194,255));
+        label(dc,{610,480,790,526},L"返回菜单 (Esc)",20,RGB(210,221,238));
+        label(dc,{60,540,940,580},L"第 "+std::to_wstring(selected/15+1)+L" / "+std::to_wstring((levels.size()+14)/15)+L" 页  ·  战役 / levels 自定义地图",17,RGB(139,157,183));
     }
 
     void update(HWND window) {
@@ -232,16 +612,26 @@ struct Application {
         }
         if (smoke) {
             ++smokeTicks;
+            const auto hover=[&](int x,int y){
+                const RECT view=viewport(window);
+                SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(view.left+x*(view.right-view.left)/1000,view.top+y*(view.bottom-view.top)/600));
+            };
             if (smokeTicks == 1) {
-                updateDemo();
-                if (!intro || demoTicks!=1 || demo.level().id!=0)
-                    throw std::runtime_error("intro demo failed");
                 SendMessageW(window,WM_PAINT,0,0);
                 SendMessageW(window,WM_KEYDOWN,VK_RETURN,0);
-                if(intro || !menu || started) throw std::runtime_error("intro did not open level selection");
+                SendMessageW(window,WM_LBUTTONDOWN,0,MAKELPARAM(500,400));
+                if(!intro)throw std::runtime_error("title screen must require Space");
+                SendMessageW(window,WM_KEYDOWN,VK_SPACE,0);
+                SendMessageW(window,WM_KEYUP,VK_SPACE,0);
+                if(intro || !menu || started || page!=Page::Main) throw std::runtime_error("intro did not open main menu");
+                SendMessageW(window,WM_KEYDOWN,VK_F10,0);
+                if(!recordingMessage.empty()||recorder.active)throw std::runtime_error("disabled recording left a persistent message");
                 SendMessageW(window,WM_KEYDOWN,VK_RETURN,static_cast<LPARAM>(1LL<<30));
                 if(started) throw std::runtime_error("intro key repeat started a level");
                 SendMessageW(window,WM_KEYUP,VK_RETURN,0);
+                SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
+                if(page!=Page::Levels || started)throw std::runtime_error("main menu did not open level selection");
+                SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
                 SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
                 if(exitPressed) throw std::runtime_error("menu E leaked into exit action");
                 SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
@@ -255,6 +645,59 @@ struct Application {
                     throw std::runtime_error("level intro did not freeze physics");
                 stepLevelIntro();
                 if (levelIntroActive()) throw std::runtime_error("level intro did not finish automatically");
+                if(!tutorialActive)throw std::runtime_error("level 0 did not start live tutorial");
+                for(int stage=0;stage<6;++stage){
+                    tutorial.reset(stage);smoke=false;
+                    for(int i=0;i<(stage>=4?170:80);++i)update(window);
+                    smoke=true;
+                    if(game.player().body.position!=introPosition||!shots.empty()||recorder.active)throw std::runtime_error("tutorial changed live game");
+                    if(stage==4){
+                        smoke=false;while(tutorial.frame<3*por2::Tutorial::MappingPhaseFrames-10)update(window);smoke=true;
+                        if(tutorial.phase!=2||tutorial.scene.player().body.direction!=por2::Direction::Down)throw std::runtime_error("reversed portal lesson did not invert the actor");
+                    }
+                    SendMessageW(window,WM_PAINT,0,0);
+                    if(stage==0){
+                        tutorial.reset(0);
+                        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(850,140));
+                        SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(850,140));
+                        if(!tutorialPractice)throw std::runtime_error("practice button did not enable control");
+                        const auto initial=tutorial.scene.player().body.position;
+                        const int animationFrame=tutorial.frame;
+                        SendMessageW(window,WM_KEYDOWN,bindings[1],0);
+                        smoke=false;for(int i=0;i<8;++i)update(window);smoke=true;
+                        SendMessageW(window,WM_KEYUP,bindings[1],0);
+                        if(tutorial.scene.player().body.position.x<=initial.x||tutorial.frame!=animationFrame||game.player().body.position!=introPosition)throw std::runtime_error("practice movement or isolation failed");
+                        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(260,389));
+                        smoke=false;update(window);smoke=true;
+                        if(!tutorial.attempted||!tutorial.accepted)throw std::runtime_error("practice mouse shot failed");
+                        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(490,560));
+                        const auto paused=tutorial.scene.player().body.position;
+                        smoke=false;update(window);smoke=true;
+                        if(!tutorialPaused||tutorial.scene.player().body.position!=paused)throw std::runtime_error("practice pause failed");
+                        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(850,140));
+                        if(tutorialPractice||tutorialPaused||!shots.empty())throw std::runtime_error("return to automatic demo failed");
+                    }
+                    if(stage==2){
+                        const int frozen=tutorial.frame;
+                        SendMessageW(window,WM_KEYDOWN,'P',0);
+                        SendMessageW(window,WM_KEYDOWN,'P',static_cast<LPARAM>(1LL<<30));
+                        SendMessageW(window,WM_KEYUP,'P',0);
+                        smoke=false;update(window);smoke=true;
+                        if(!tutorialPaused||tutorial.frame!=frozen)throw std::runtime_error("tutorial pause failed");
+                        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(490,560));
+                        SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(490,560));
+                        smoke=false;update(window);smoke=true;
+                        if(tutorialPaused||tutorial.frame==frozen)throw std::runtime_error("tutorial resume failed");
+                        const int pausedFrame=tutorial.frame;openMenu(Page::Settings);
+                        smoke=false;update(window);smoke=true;
+                        if(tutorial.frame!=pausedFrame)throw std::runtime_error("settings did not pause teaching scene");
+                        resume();
+                    }
+                }
+                SendMessageW(window,WM_KEYDOWN,VK_SPACE,0);
+                SendMessageW(window,WM_KEYDOWN,VK_SPACE,static_cast<LPARAM>(1LL<<30));
+                if(tutorialActive||keys[VK_SPACE])throw std::runtime_error("tutorial completion leaked input");
+                SendMessageW(window,WM_KEYUP,VK_SPACE,0);
                 beginLevelIntro();
                 levelIntroTicks=40;
                 SendMessageW(window,WM_PAINT,0,0);
@@ -262,6 +705,7 @@ struct Application {
                 SendMessageW(window, WM_KEYDOWN, 'D', static_cast<LPARAM>(1LL<<30));
                 if (levelIntroActive() || keys['D'])
                     throw std::runtime_error("intro skip leaked into movement");
+                finishTutorial();
             }
             if (smokeTicks == 8) SendMessageW(window, WM_KEYUP, 'D', 0);
             if (smokeTicks == 2) {
@@ -297,19 +741,111 @@ struct Application {
                 if (keys['A']) throw std::runtime_error("window smoke: focus loss left a key pressed");
             }
             if (smokeTicks == 13) {
+                SendMessageW(window,WM_LBUTTONDOWN,0,MAKELPARAM(962,30));
+                SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(962,30));
+                if(!menu || page!=Page::Main) throw std::runtime_error("menu did not pause");
+                const auto frozen=game.player().body.position;
+                const auto portals=game.portals();
+                menuClick(window,{500,260});
+                if(page!=Page::Settings)throw std::runtime_error("settings navigation failed");
+                hover(500,170);
+                if(buttonColor(bindingRow(1))!=RGB(35,110,174)||buttonColor(bindingRow(0),true)==RGB(35,110,174))
+                    throw std::runtime_error("settings hover did not replace keyboard highlight");
+                hover(300,510);
+                if(buttonColor({190,492,490,532})!=RGB(35,110,174))throw std::runtime_error("reset button hover failed");
+                SendMessageW(window,WM_MOUSELEAVE,0,0);
+                if(buttonColor({190,492,490,532})==RGB(35,110,174))throw std::runtime_error("mouse leave retained hover");
+                hover(500,170);
+                smoke=false;update(window);smoke=true;
+                if(game.player().body.position!=frozen || game.portals()[0].active()!=portals[0].active())throw std::runtime_error("settings did not pause game");
+                SendMessageW(window,WM_PAINT,0,0);
+                menuClick(window,{500,510});
+                if(page!=Page::Help||helpText.find(L"射击必须命中门的中间方块")==std::wstring::npos)
+                    throw std::runtime_error("help did not read tutorial markdown");
+                SendMessageW(window,WM_PAINT,0,0);
+                SendMessageW(window,WM_KEYDOWN,VK_NEXT,0);
+                if(helpScroll<=0)throw std::runtime_error("help scrolling failed");
+                SendMessageW(window,WM_KEYDOWN,VK_END,0);
+                if(helpScroll!=std::max(0,helpHeight-400))throw std::runtime_error("help cannot reach end of tutorial");
                 SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);
-                if(!menu) throw std::runtime_error("menu did not pause");
+                if(page!=Page::Settings)throw std::runtime_error("help back did not restore settings");
+                settingItem=0;activateSetting();
+                SendMessageW(window,WM_KEYDOWN,'D',0);SendMessageW(window,WM_KEYUP,'D',0);
+                if(rebinding!=0 || bindings[0]!='A')throw std::runtime_error("duplicate binding accepted");
+                SendMessageW(window,WM_KEYDOWN,'J',0);SendMessageW(window,WM_KEYUP,'J',0);
+                if(rebinding!=-1 || bindings[0]!='J' || keys['J'])throw std::runtime_error("rebind failed or leaked input");
+                menuClick(window,{300,450});
+                if(speedTenths!=1)throw std::runtime_error("speed setting click failed");
+                bindingsPath=std::filesystem::temp_directory_path()/("por2-bindings-test-"+std::to_string(GetCurrentProcessId())+".ini");
+                renderer.crownUnlocked=true;menuClick(window,{500,550});
+                if(renderer.crownVisible)throw std::runtime_error("crown setting did not hide crown");
+                smoke=false;saveBindings();smoke=true;
+                renderer.crownUnlocked=false;renderer.crownVisible=true;
+                bindings=DefaultBindings;speedTenths=10;loadBindings(bindingsPath);
+                std::filesystem::remove(bindingsPath);
+                if(bindings[0]!='J'||speedTenths!=1)throw std::runtime_error("bindings or speed did not persist");
+                if(!renderer.crownUnlocked||renderer.crownVisible)throw std::runtime_error("crown unlock and visibility did not persist");
+                renderer.crownUnlocked=false;renderer.crownVisible=true;
+                speedTenths=10;
+                settingItem=2;activateSetting();
+                SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);SendMessageW(window,WM_KEYUP,VK_ESCAPE,0);
+                if(rebinding!=-1 || bindings[2]!='W' || page!=Page::Settings)throw std::runtime_error("cancel binding failed");
+                SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);SendMessageW(window,WM_KEYUP,VK_ESCAPE,0);
+                if(page!=Page::Main || !menu)throw std::runtime_error("settings back resumed game");
+                SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);SendMessageW(window,WM_KEYUP,VK_ESCAPE,0);
+                if(menu || game.player().body.position!=frozen)throw std::runtime_error("resume changed game");
+                SendMessageW(window,WM_KEYDOWN,'J',0);
+                smoke=false;update(window);smoke=true;
+                SendMessageW(window,WM_KEYUP,'J',0);
+                if(game.player().body.position.x>=frozen.x)throw std::runtime_error("new movement binding not applied");
+                for(int speed=1;speed<=10;++speed){
+                    speedTenths=speed;gameClock=0;
+                    por2::Game reference=game;
+                    por2::InputFrame expected;expected.movement.left=true;
+                    expected.shots.push_back({0,{260,389}});expected.useExit=true;
+                    keys['J']=true;shots=expected.shots;exitPressed=true;
+                    smoke=false;
+                    int frames=0;
+                    for(int i=1;i<=10;++i){
+                        update(window);
+                        if(i*speed/10>frames){reference.tick(expected);expected.shots.clear();expected.useExit=false;++frames;}
+                        if(game.player().body.position!=reference.player().body.position||game.player().velocity!=reference.player().velocity)
+                            throw std::runtime_error("decimal speed changed logical frame result");
+                        if(frames==0&&(shots.size()!=1||!exitPressed))throw std::runtime_error("slow mode dropped queued input");
+                    }
+                    smoke=true;
+                    if(frames!=speed||gameClock!=0||!shots.empty()||exitPressed)throw std::runtime_error("decimal speed timing drifted");
+                }
+                speedTenths=10;gameClock=0;
+                openMenu(Page::Settings);settingItem=8;activateSetting();
+                if(bindings!=DefaultBindings)throw std::runtime_error("restore bindings failed");
+                openMenu();
                 RECT before{}; GetWindowRect(window,&before);
-                toggleFullscreen(window);
+                openMenu(Page::Settings);
+                menuClick(window,{660,450});
                 const RECT r=viewport(window);
                 auto point=logicalPoint(window,(r.left+r.right)/2,(r.top+r.bottom)/2);
                 if(!fullscreen || !point || std::abs(point->x-500)>1 || std::abs(point->y-300)>1)
                     throw std::runtime_error("fullscreen coordinate mapping failed");
-                toggleFullscreen(window);
+                settingItem=11;activateSetting(window);
                 RECT after{}; GetWindowRect(window,&after);
                 if(!EqualRect(&before,&after)) throw std::runtime_error("window bounds not restored");
+                openMenu(Page::Levels);menuClick(window,{700,500});
+                if(fullscreen)throw std::runtime_error("level selection retained fullscreen button");
+                openMenu();
             }
             if(smokeTicks==14) {
+                menuClick(window,{500,340});
+                if(page!=Page::Levels)throw std::runtime_error("pause menu did not open level selection");
+                if(levels[selected]!=game.level().id || levelTextColor(selected)!=RGB(139,157,183))
+                    throw std::runtime_error("current level text is not gray");
+                const int currentSelection=selected;
+                hover(400,160);
+                if(buttonColor(card(1))!=RGB(35,110,174)||selected!=currentSelection)
+                    throw std::runtime_error("level hover changed selection or failed to highlight");
+                SendMessageW(window,WM_PAINT,0,0);
+                hover(500,570);
+                if(buttonColor(card(1))==RGB(35,110,174))throw std::runtime_error("empty area retained hover");
                 auto found=std::find(levels.begin(),levels.end(),16);
                 if(found==levels.end()) throw std::runtime_error("map16 missing from menu");
                 selected=static_cast<int>(found-levels.begin());
@@ -327,40 +863,31 @@ struct Application {
                 if(!exitPressed) throw std::runtime_error("E did not trigger exit");
                 exitPressed=false;
                 SendMessageW(window,WM_KEYDOWN,'E',static_cast<LPARAM>(1LL<<30));
-                if(exitPressed) throw std::runtime_error("repeated E triggered exit");
+                if(exitPressed) throw std::runtime_error("repeated Enter triggered exit");
                 SendMessageW(window,WM_KEYUP,'E',0);
             }
-            if(smokeTicks==15) {
-                SendMessageW(window,WM_KEYDOWN,'G',0);
-                SendMessageW(window,WM_KEYDOWN,'G',static_cast<LPARAM>(1LL<<30));
-                SendMessageW(window,WM_KEYUP,'G',0);
-            }
-            if(smokeTicks==16) {
-                if(game.gravity()!=por2::Direction::Left) throw std::runtime_error("G repeat cycled gravity more than once");
-                for(int i=0;i<2;++i) {
-                    SendMessageW(window,WM_KEYDOWN,'G',0);
-                    SendMessageW(window,WM_KEYUP,'G',0);
-                }
-            }
-            if(smokeTicks==17 && game.gravity()!=por2::Direction::Right)
-                throw std::runtime_error("multiple G taps lost");
-            if (smokeTicks == 18) {
+            if (smokeTicks == 15) {
                 smoke=false;
                 std::istringstream sample("level 0\nd 2\ns 0 260 389\nz 1\n");
                 startReplay(por2::ReplayScript::parse(sample));
                 SendMessageW(window,WM_KEYDOWN,VK_SPACE,0);
                 update(window);
                 if(replay.frame!=0) throw std::runtime_error("paused replay advanced");
+                speedTenths=1;
                 SendMessageW(window,WM_KEYDOWN,VK_OEM_PERIOD,0);
                 update(window);
                 if(replay.frame!=1 || !replay.paused) throw std::runtime_error("replay single frame failed");
+                speedTenths=5;
+                SendMessageW(window,WM_KEYDOWN,'R',0);
+                update(window);
+                if(replay.frame!=0)throw std::runtime_error("replay ignored speed setting");
+                update(window);
+                if(replay.frame!=1)throw std::runtime_error("replay speed setting timing failed");
+                speedTenths=10;
                 SendMessageW(window,WM_KEYDOWN,'R',0);
                 SendMessageW(window,WM_KEYDOWN,VK_F8,0);
-                for(int i=0;i<3;++i) update(window);
-                if(replay.frame!=0) throw std::runtime_error("slow replay advanced early");
                 update(window);
-                if(replay.frame!=1) throw std::runtime_error("slow replay timing failed");
-                SendMessageW(window,WM_KEYDOWN,VK_F8,0);
+                if(replay.frame!=1)throw std::runtime_error("removed F8 slow mode still affects replay");
                 for(int i=0;i<3;++i) update(window);
                 if(!replay.completed || replay.frame!=4 || !replayAim)
                     throw std::runtime_error("replay completion or shot visualization failed");
@@ -369,41 +896,97 @@ struct Application {
                 if(game.player().body.position!=frozen) throw std::runtime_error("finished replay did not freeze");
                 smoke=true;
                 SendMessageW(window,WM_PAINT,0,0);
+                const RECT view=viewport(window);
+                const int uiX=view.left+890*(view.right-view.left)/1000,uiY=view.top+30*(view.bottom-view.top)/600;
+                SendMessageW(window,WM_LBUTTONDOWN,0,MAKELPARAM(uiX,uiY));
+                SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(uiX,uiY));
+                if(!hideReplayUi()||!shots.empty()||replay.frame!=4)throw std::runtime_error("replay UI button leaked input or did not hide");
+                const auto head=game.traversal().aimOrigin;
+                if(renderer.pixels()[static_cast<int>(std::lround(head.y))*1000+static_cast<int>(std::lround(head.x))]!=0xFF0000)
+                    throw std::runtime_error("hidden replay UI hid the red head point");
+                SendMessageW(window,WM_PAINT,0,0);
+                SendMessageW(window,WM_KEYDOWN,VK_F9,0);
+                if(hideReplayUi())throw std::runtime_error("replay UI restore failed");
                 SendMessageW(window,WM_KEYDOWN,VK_F7,0);
                 if(replay.active) throw std::runtime_error("replay stop failed");
+                SendMessageW(window,WM_KEYDOWN,VK_F10,0);
+                if(!recorder.active||game.player().body.position!=game.level().spawn.position)throw std::runtime_error("recording did not restart level");
+                speedTenths=3;SendMessageW(window,WM_KEYDOWN,'D',0);smoke=false;
+                for(int i=0;i<20;++i)update(window);
+                smoke=true;SendMessageW(window,WM_KEYUP,'D',0);
+                if(recorder.script.totalFrames!=6)throw std::runtime_error("recording used wall frames instead of logical frames");
+                const auto recordedPosition=game.player().body.position;
+                openMenu();smoke=false;update(window);smoke=true;
+                if(recorder.script.totalFrames!=6)throw std::runtime_error("menu was recorded as gameplay");
+                bindingsPath=(screenshot.empty()?std::filesystem::temp_directory_path():std::filesystem::path(screenshot).parent_path())/
+                    ("smoke-recording-"+std::to_string(GetCurrentProcessId()))/"keybindings.ini";
+                smoke=false;SendMessageW(window,WM_KEYDOWN,VK_F10,0);smoke=true;
+                if(recorder.active||recorder.pending||lastRecordingPath.empty())throw std::runtime_error("recording did not stop and save");
+                por2::Replay recordedReplay;por2::Game playback(0);
+                recordedReplay.start(por2::ReplayScript::load(lastRecordingPath),0,playback);
+                while(!recordedReplay.completed)recordedReplay.step(playback);
+                if(playback.player().body.position!=recordedPosition)throw std::runtime_error("window recording playback differs");
+                loadMaps();
+                if(customLevels.empty()||!mapWarnings.empty())throw std::runtime_error("editor JSON catalog failed to load");
+                selected=static_cast<int>(levels.size())-1;startSelected();
+                if(game.level().editorJson.empty()||game.level().id!=levels[selected])throw std::runtime_error("custom map selection did not start map");
+                endLevelIntro();openMenu(Page::Levels);SendMessageW(window,WM_PAINT,0,0);
+                if(menuButton(4).left!=menuRow(3).left||menuButton(5).right!=menuRow(3).right||menuButton(3).top<=menuButton(4).bottom)
+                    throw std::runtime_error("record/replay menu layout failed");
                 if (!paintCount) throw std::runtime_error("window smoke: paint callback was never called");
                 DestroyWindow(window);
                 return;
             }
         }
+        if(!menu&&tutorialActive){
+            if(!tutorialPaused){
+                if(tutorialPractice){
+                    if(keys[bindings[4]]){tutorial.reset(tutorial.stage);clearInput();}
+                    por2::InputFrame practice;
+                    practice.movement={keys[bindings[0]],keys[bindings[1]],keys[bindings[2]]};
+                    tutorial.movement=practice.movement;tutorial.scene.tick(practice);
+                    for(const auto& shot:shots){tutorial.attempted=true;tutorial.accepted=tutorial.scene.shoot(shot);}
+                    shots.clear();
+                    tutorial.aim=menuPointer?std::optional<por2::Shot>{{previewPortal,*menuPointer}}:std::nullopt;
+                }else tutorial.update();
+            }
+            renderer.draw(tutorial.scene,true,true,tutorialPractice&&!previewEnabled?std::nullopt:tutorial.aim,false);
+            InvalidateRect(window,nullptr,FALSE);return;
+        }
         por2::InputFrame input;
-        input.movement = {keys['A'], keys['D'], keys['W'], keys['S']};
-        input.gravityTurns = gravityTurns;
-        gravityTurns = 0;
+        input.movement = {keys[bindings[0]], keys[bindings[1]], keys[bindings[2]], keys['S']};
         if (!menu && levelIntroActive()) {
             stepLevelIntro();
             InvalidateRect(window,nullptr,FALSE);
             return;
         }
-        input.restart = keys['R'];
-        input.useExit = exitPressed;
-        exitPressed = false;
-        //input.skip = keys[VK_LCONTROL];
-        input.shots.swap(shots);
+        const bool advanceLogic=!menu&&(replay.active || logicDue(gameClock));
+        if(advanceLogic){
+            input.restart = keys[bindings[4]];
+            input.gravityTurns = gravityTurns;
+            gravityTurns = 0;
+            input.useExit = exitPressed;
+            exitPressed = false;
+            input.shots.swap(shots);
+        }
         const auto before=game.player().body.position;
         const int previousLevel=game.level().id;
         const bool previouslyFinished=game.finished();
-        if(!menu) {
+        if(advanceLogic) {
             if (replay.active) {
-                if (!replay.completed && (replaySingle || (!replay.paused && ++replayClock >= (replaySlow?4:1)))) {
-                    replayClock=0;
+                if (!replay.completed && (replaySingle || (!replay.paused && logicDue(replayClock)))) {
+                    if(replaySingle)replayClock=0;
                     replay.step(game);
                     if (aimTicks>0) --aimTicks;
                     const auto& action=replay.script.actions[replay.lastAction];
                     if (!action.input.shots.empty()) { replayAim=action.input.shots.front(); aimTicks=15; }
                 }
                 replaySingle=false;
-            } else game.tick(input);
+            } else {
+                const bool recording=recorder.active;
+                recorder.capture(input);game.tick(input);
+                if(recording&&(!recorder.active||game.level().id!=previousLevel||game.finished()))stopRecording();
+            }
         }
         if (!replay.active && (game.level().id!=previousLevel || (previouslyFinished && !game.finished())))
             beginLevelIntro();
@@ -418,10 +1001,11 @@ struct Application {
             }
         }
         if(previewEnabled && smoke && smokeTicks==10) preview=por2::Shot{0,{260,389}};
-        renderer.draw(game, debug, grid, preview);
+        if(game.crowned()&&!renderer.crownUnlocked){renderer.crownUnlocked=true;saveBindings();}
+        renderer.draw(game, debug, grid&&!hideReplayUi(), preview);
         const std::string nextTitle = game.finished()
-            ? "Por2D - Completed! R: play again | Esc: menu | F11: fullscreen"
-            : "Por2D - " + game.level().name + " | Esc: levels  F11: fullscreen | WASD: move/jump  G: gravity  E: exit  R: restart";
+            ? "Por2D - Completed! | Esc: menu | F11: fullscreen"
+            : "Por2D - " + game.level().name + " | Esc: pause / menu | F11: fullscreen";
         if (nextTitle != title) { title = nextTitle; SetWindowTextW(window, utf8(title).c_str()); }
         InvalidateRect(window, nullptr, FALSE);
         if (smoke) SendMessageW(window, WM_PAINT, 0, 0);
@@ -449,6 +1033,24 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
     case WM_SYSKEYUP: {
         const bool pressed = message != WM_KEYUP && message != WM_SYSKEYUP;
         unsigned key = static_cast<unsigned>(wparam);
+        if(message==WM_SYSKEYDOWN && key==VK_F4)return DefWindowProcW(window,message,wparam,lparam);
+        if(app->intro){
+            if(pressed&&!(lparam&(1LL<<30))){
+                if(key==VK_SPACE){app->leaveIntro();app->suppressedKey=key;}
+                else if(key==VK_F11)app->toggleFullscreen(window);
+                InvalidateRect(window,nullptr,FALSE);
+            }
+            return 0;
+        }
+        if(pressed&&!(lparam&(1LL<<30))&&key==VK_F10&&app->rebinding<0){app->toggleRecording();InvalidateRect(window,nullptr,FALSE);return 0;}
+        if(app->menu && app->page==Application::Page::Settings && app->rebinding>=0){
+            if(pressed && !(lparam&(1LL<<30))){
+                if(key==VK_ESCAPE)app->back();else app->assignBinding(key);
+                app->suppressedKey=key;
+                InvalidateRect(window,nullptr,FALSE);
+            }
+            return 0;
+        }
         if (pressed && !(lparam & (1LL<<30)) && key==VK_F6) {
             app->importReplay(window); return 0;
         }
@@ -459,9 +1061,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
                 if (key=='R') {
                     app->replay.restart(app->game); app->replayClock=app->aimTicks=0;
                     app->replaySingle=false; app->replayAim.reset(); app->clearInput();
-                    app->renderer.draw(app->game,app->debug,app->grid);
+                    app->renderer.draw(app->game,app->debug,app->grid&&!app->hideReplayUi());
                 }
-                if (key==VK_F8) { app->replaySlow=!app->replaySlow; app->replayClock=0; }
+                if (key==VK_F9)app->toggleReplayUi(window);
                 if (key==VK_F7) { app->replay.active=false; app->clearInput(); }
                 InvalidateRect(window,nullptr,FALSE);
             }
@@ -471,7 +1073,33 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
             if (!pressed) app->suppressedKey=256;
             return 0;
         }
-        if (app->levelIntroActive() && !app->menu) {
+        if(app->menu&&app->page==Application::Page::Help){
+            if(pressed){
+                if(key==VK_ESCAPE)app->back();
+                if(key==VK_DOWN)app->scrollHelp(48);if(key==VK_UP)app->scrollHelp(-48);
+                if(key==VK_NEXT)app->scrollHelp(360);if(key==VK_PRIOR)app->scrollHelp(-360);
+                if(key==VK_HOME)app->scrollHelp(-app->helpHeight);if(key==VK_END)app->scrollHelp(app->helpHeight);
+                InvalidateRect(window,nullptr,FALSE);
+            }return 0;
+        }
+        if(app->tutorialActive&&!app->menu){
+            if(app->tutorialPractice&&key!=VK_ESCAPE&&key!=VK_F11){
+                if(key==VK_CONTROL)key=(lparam&(1LL<<24))?VK_RCONTROL:VK_LCONTROL;
+                if(key<app->keys.size())app->keys[key]=pressed&&!app->tutorialPaused;
+                if(pressed&&!(lparam&(1LL<<30))&&key==app->bindings[5])app->previewEnabled=!app->previewEnabled;
+                if(pressed&&!app->tutorialPaused&&!(lparam&(1LL<<30)))for(int i=0;i<2;++i)if(key==app->bindings[6+i])app->keyboardShot(window,i);
+                return 0;
+            }
+            if(pressed&&!(lparam&(1LL<<30))){
+                if(key=='P'){app->tutorialPaused=!app->tutorialPaused;app->clearInput();}
+                if(key==VK_SPACE||key==VK_RIGHT||key==VK_RETURN)app->tutorialStep(1);
+                if(key==VK_LEFT)app->tutorialStep(-1);
+                if(key==VK_ESCAPE)app->openMenu();
+                if(key==VK_F11)app->toggleFullscreen(window);
+                app->suppressedKey=key;InvalidateRect(window,nullptr,FALSE);
+            }return 0;
+        }
+        if (app->levelIntroActive() && !app->menu && key!=VK_ESCAPE) {
             if (pressed && !(lparam & (1LL<<30))) {
                 app->endLevelIntro();
                 app->suppressedKey=key;
@@ -479,19 +1107,29 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
             }
             return 0;
         }
-        if (app->intro && pressed && !(lparam & (1LL<<30))) {
-            app->leaveIntro();
-            InvalidateRect(window,nullptr,FALSE);
-            return 0;
-        }
         if (key == VK_CONTROL) key = (lparam & (1LL << 24)) ? VK_RCONTROL : VK_LCONTROL;
-        if (key < app->keys.size()) app->keys[key] = pressed;
+        if (!app->menu && key < app->keys.size()) app->keys[key] = pressed;
         if (pressed && !(lparam & (1LL << 30))) {
+            if (key=='G' && !app->menu) app->gravityTurns=(app->gravityTurns+1)%4;
             if (key == VK_F11 || (key==VK_RETURN && (lparam & (1LL<<29)))) { app->toggleFullscreen(window); return 0; }
-            if (key == VK_ESCAPE) { if(!app->menu || app->started) app->menu=!app->menu; app->clearInput(); }
-            if(key=='E' && !app->menu) app->exitPressed=true;
-            if(key=='G' && !app->menu) app->gravityTurns=(app->gravityTurns+1)%4;
+            if (key == VK_ESCAPE) {
+                if(app->menu)app->back();else app->openMenu();
+                InvalidateRect(window,nullptr,FALSE);return 0;
+            }
+            if(key==app->bindings[3] && !app->menu) app->exitPressed=true;
             if(app->menu) {
+                if(key==VK_LEFT||key==VK_RIGHT||key==VK_UP||key==VK_DOWN||key==VK_PRIOR||key==VK_NEXT||key==VK_RETURN)
+                    app->mouseNavigation=false;
+                if(app->page!=Application::Page::Levels){
+                    int& item=app->page==Application::Page::Main?app->menuItem:app->settingItem;
+                    const std::vector<int> order=app->page==Application::Page::Main?(app->started?std::vector<int>{0,1,2,4,5,3}:std::vector<int>{0,1,2,5,3}):std::vector<int>{0,1,2,3,4,5,6,7,10,11,8,12,13,9};
+                    const int index=static_cast<int>(std::find(order.begin(),order.end(),item)-order.begin());
+                    if(key==VK_UP)item=order[(index+order.size()-1)%order.size()];
+                    if(key==VK_DOWN)item=order[(index+1)%order.size()];
+                    if(app->page==Application::Page::Main&&(item==4||item==5)){if(key==VK_LEFT)item=4;if(key==VK_RIGHT)item=5;}
+                    if(key==VK_RETURN){if(app->page==Application::Page::Main)app->activateMenu(window);else app->activateSetting(window);}
+                    InvalidateRect(window,nullptr,FALSE);return 0;
+                }
                 int delta=0;
                 if(key==VK_LEFT) delta=-1;
                 if(key==VK_RIGHT) delta=1;
@@ -501,28 +1139,68 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
                 if(key==VK_NEXT) delta=15;
                 app->selected=std::clamp(app->selected+delta,0,static_cast<int>(app->levels.size())-1);
                 if(key==VK_RETURN) app->startSelected();
+                InvalidateRect(window,nullptr,FALSE);return 0;
             }
             if (key == VK_F1) app->debug = !app->debug;
             if (key == VK_F2) app->grid = !app->grid;
-            if (key == 'Q') app->previewEnabled = !app->previewEnabled;
+            if (key == app->bindings[5]) app->previewEnabled = !app->previewEnabled;
+            for(int i=0;i<2;++i)if(key==app->bindings[6+i])app->keyboardShot(window,i);
         }
         if(message==WM_SYSKEYDOWN) return DefWindowProcW(window,message,wparam,lparam);
         return 0;
     }
+    case WM_MOUSEMOVE: {
+        app->menuPointer=logicalPoint(window,GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam));
+        app->mouseNavigation=true;
+        TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT),TME_LEAVE,window,0};
+        TrackMouseEvent(&tracking);
+        if(app->menu||app->replay.active)InvalidateRect(window,nullptr,FALSE);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        app->menuPointer.reset();app->mouseNavigation=true;
+        if(app->menu||app->replay.active)InvalidateRect(window,nullptr,FALSE);
+        return 0;
+    case WM_MOUSEWHEEL:
+        if(app->menu&&app->page==Application::Page::Help){app->scrollHelp(-GET_WHEEL_DELTA_WPARAM(wparam)*96/WHEEL_DELTA);InvalidateRect(window,nullptr,FALSE);}
+        return 0;
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
+        app->menuPointer=logicalPoint(window,GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam));
+        app->mouseNavigation=true;
+        if(app->intro)return 0;
+        if(!app->menu&&message==WM_LBUTTONDOWN&&app->menuPointer&&contains(GearButton,*app->menuPointer)){
+            app->openMenu();InvalidateRect(window,nullptr,FALSE);return 0;
+        }
+        if(app->tutorialActive&&!app->menu){
+            if(app->tutorialPractice&&!app->tutorialPaused&&app->menuPointer&&app->menuPointer->y>160&&app->menuPointer->y<450){
+                for(int i=0;i<2;++i)if(app->bindings[6+i]==(message==WM_LBUTTONDOWN?VK_LBUTTON:VK_RBUTTON)){app->previewPortal=i;app->shots.push_back({i,*app->menuPointer});}
+            }
+            if(message==WM_LBUTTONDOWN&&app->menuPointer){const auto p=*app->menuPointer;
+                if(contains(LessonPractice,p))app->togglePractice();
+                if(contains(LessonPrevious,p))app->tutorialStep(-1);
+                if(contains(LessonSettings,p))app->openMenu(Application::Page::Settings);
+                if(contains(LessonPause,p)){app->tutorialPaused=!app->tutorialPaused;app->clearInput();}
+                if(contains(LessonSkip,p))app->finishTutorial();
+                if(contains(LessonNext,p))app->tutorialStep(1);
+                InvalidateRect(window,nullptr,FALSE);
+            }return 0;
+        }
+        if(app->replay.active&&!app->menu&&message==WM_LBUTTONDOWN&&app->menuPointer&&contains(ReplayUiButton,*app->menuPointer)){
+            app->toggleReplayUi(window);return 0;
+        }
+        if(app->menu && app->page==Application::Page::Settings && app->rebinding>=0){
+            app->assignBinding(message==WM_LBUTTONDOWN?VK_LBUTTON:VK_RBUTTON);
+            InvalidateRect(window,nullptr,FALSE);return 0;
+        }
         if(app->replay.active && !app->menu) return 0;
         if(app->levelIntroActive() && !app->menu) {
             app->endLevelIntro();
             InvalidateRect(window,nullptr,FALSE);
             return 0;
         }
-        if(app->intro) {
-            app->leaveIntro();
-            InvalidateRect(window,nullptr,FALSE);
-            return 0;
-        }
-        app->previewPortal = message == WM_LBUTTONDOWN ? 0 : 1;
+        if(!app->menu)for(int i=0;i<2;++i)
+            if(app->bindings[6+i]==(message==WM_LBUTTONDOWN?VK_LBUTTON:VK_RBUTTON))app->previewPortal=i;
         app->mousePressed[message == WM_LBUTTONDOWN ? 0 : 1] = true;
         SetCapture(window);
         return 0;
@@ -532,7 +1210,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         const auto point=logicalPoint(window,GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam));
         if(app->mousePressed[id] && point) {
             if(app->menu) { if(id==0) app->menuClick(window,*point); }
-            else app->shots.push_back({id,*point});
+            else for(int i=0;i<2;++i)if(app->bindings[6+i]==(id==0?VK_LBUTTON:VK_RBUTTON))app->shots.push_back({i,*point});
         }
         app->mousePressed[id] = false;
         if (!app->mousePressed[0] && !app->mousePressed[1]) ReleaseCapture();
@@ -566,26 +1244,35 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         if(app->intro) app->drawIntro(dc);
         else if(app->menu) app->drawMenu(dc);
         else if(app->levelIntroActive()) app->drawLevelIntro(dc);
-        else if (app->game.finished()) {
+        else if(app->tutorialActive)app->drawTutorial(dc);
+        else if (app->game.finished()&&!app->hideReplayUi()) {
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, RGB(255, 255, 255));
             RECT area{0, 30, por2::WindowWidth, 70};
-            DrawTextW(dc, L"Completed!  R: play again    Esc: levels", -1, &area, DT_CENTER | DT_SINGLELINE);
+            const auto completed=L"已完成！  "+keyName(app->bindings[4])+L"：重新开始    Esc：菜单";
+            DrawTextW(dc, completed.c_str(), -1, &area, DT_CENTER | DT_SINGLELINE);
         }
-        if(!app->menu && !app->intro && !app->levelIntroActive()) {
-            const auto level=app->replay.active?por2::makeLevel(app->replay.initialLevel):app->game.level();
+        if(!app->menu && !app->intro && !app->levelIntroActive() && !app->tutorialActive && !app->hideReplayUi()) {
+            const auto level=app->replay.active?(app->replay.script.customLevel?*app->replay.script.customLevel:por2::makeLevel(app->replay.initialLevel)):app->game.level();
             const auto entry=std::find(por2::Campaign.begin(),por2::Campaign.end(),level.id);
-            const std::string caption = (entry!=por2::Campaign.end()?"Level"+std::to_string(entry-por2::Campaign.begin()):"实验地图") + "  " + level.name;
+            const std::string prefix=!level.editorJson.empty()?"自定义":entry!=por2::Campaign.end()?"Level"+std::to_string(entry-por2::Campaign.begin()):"实验地图";
+            const std::string caption = prefix + "  " + level.name;
             const std::wstring wide=utf8(caption);
             RECT levelArea{690, 548, 975, 588};
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, RGB(220, 230, 245));
             DrawTextW(dc, wide.c_str(), -1, &levelArea, DT_RIGHT | DT_BOTTOM | DT_SINGLELINE);
-            const std::array<const wchar_t*,4> names{{L"上 ↑",L"右 →",L"下 ↓",L"左 ←"}};
-            fill(dc,{12,548,302,588},RGB(15,21,34));
-            label(dc,{12,548,302,588},std::wstring(L"重力：")+names[static_cast<int>(app->game.gravity())]+L"   G 切换",20,RGB(255,210,130));
         }
         if(!app->menu && !app->intro) app->drawReplay(dc);
+        if(!app->menu&&!app->intro&&!app->levelIntroActive()&&!app->tutorialActive&&!app->replay.active){
+            const std::array<std::wstring,4> names{L"上",L"右",L"下",L"左"};
+            label(dc,{12,548,302,588},L"重力："+names[static_cast<int>(app->game.gravity())]+L"   G 切换",20,RGB(255,210,130));
+        }
+        if(!app->menu&&!app->intro&&!app->tutorialActive&&!app->replay.active&&!app->recordingMessage.empty()){
+            fill(dc,{10,10,925,44},RGB(15,21,34));
+            label(dc,{10,10,925,44},app->recordingMessage+(app->recorder.active?L" · "+std::to_wstring(app->recorder.script.totalFrames)+L" 帧":L""),17,RGB(255,190,120));
+        }
+        if(!app->intro&&!app->menu)app->drawGear(dc);
         RECT client{}; GetClientRect(window,&client);
         const RECT view=viewport(window);
         // Compose the scaled scene AND letterboxing offscreen. Clearing the visible
@@ -601,7 +1288,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
             SelectObject(frame,oldFrame); DeleteObject(frameBitmap); DeleteDC(frame);
         }
         SelectObject(dc,oldBitmap);
-        if(app->smoke && (app->smokeTicks==13 || app->intro || app->levelIntroActive() || app->replay.active) && !app->screenshot.empty()) {
+        if(app->smoke && (app->menu || app->intro || app->levelIntroActive() || app->tutorialActive || app->replay.active) && !app->screenshot.empty()) {
             std::vector<std::uint32_t> pixels(1000*600);
             if(!GetDIBits(dc,bitmap,0,600,pixels.data(),&info,DIB_RGB_COLORS))
                 app->failure="menu screenshot failed";
@@ -609,7 +1296,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
                 BITMAPFILEHEADER header{}; header.bfType=0x4d42;
                 header.bfOffBits=sizeof(header)+sizeof(BITMAPINFOHEADER);
                 header.bfSize=header.bfOffBits+static_cast<DWORD>(pixels.size()*4);
-                std::ofstream file(app->screenshot+(app->replay.active?".replay.bmp":app->intro?".intro.bmp":app->levelIntroActive()?".level-intro.bmp":".menu.bmp"),std::ios::binary);
+                std::ofstream file(app->screenshot+(app->intro?".intro.bmp":app->menu&&app->page==Application::Page::Help?".help.bmp":app->menu&&app->page==Application::Page::Settings?".settings.bmp":app->menu&&app->page==Application::Page::Levels?".levels.bmp":app->tutorialActive&&!app->menu?".tutorial"+std::to_string(app->tutorial.stage)+".bmp":app->hideReplayUi()?".replay-hidden.bmp":app->replay.active?".replay.bmp":app->levelIntroActive()?".level-intro.bmp":".menu.bmp"),std::ios::binary);
                 file.write(reinterpret_cast<const char*>(&header),sizeof(header));
                 file.write(reinterpret_cast<const char*>(&info.bmiHeader),sizeof(BITMAPINFOHEADER));
                 file.write(reinterpret_cast<const char*>(pixels.data()),pixels.size()*4);
@@ -620,6 +1307,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         EndPaint(window, &paint);
         return 0;
     }
+    case WM_CLOSE:
+        if(app->stopRecording())DestroyWindow(window);
+        return 0;
     case WM_DESTROY:
         KillTimer(window, 1);
         PostQuitMessage(0);
@@ -633,6 +1323,7 @@ int runWindow(int level, bool smoke, const std::string& screenshot, bool direct,
     SetProcessDPIAware();
     Application app(level);
     app.smoke = smoke;
+    if(!smoke){app.loadBindings();app.loadMaps();}
     app.menu=!direct || smoke; app.started=direct && !smoke;
     app.intro=!direct || smoke;
     if (direct && !smoke) app.beginLevelIntro();
@@ -652,6 +1343,7 @@ int runWindow(int level, bool smoke, const std::string& screenshot, bool direct,
     HWND window = CreateWindowExW(0, type.lpszClassName, L"Por2D", style, CW_USEDEFAULT, CW_USEDEFAULT,
         bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr, nullptr, instance, &app);
     if (!window) throw std::runtime_error("window creation failed");
+    if(!app.mapWarnings.empty())MessageBoxW(window,app.mapWarnings.c_str(),L"部分自定义地图未加载",MB_OK|MB_ICONWARNING);
     if(fullscreen) app.toggleFullscreen(window);
     ShowWindow(window, smoke ? SW_HIDE : SW_SHOW);
     if (!SetTimer(window, 1, por2::TickMilliseconds, nullptr)) {
@@ -666,7 +1358,7 @@ int runWindow(int level, bool smoke, const std::string& screenshot, bool direct,
     }
     if (status < 0) throw std::runtime_error("window message loop failed");
     if (!app.failure.empty()) throw std::runtime_error(app.failure);
-    if (smoke) std::cout << "PASS native window: timer, keyboard, mouse, restart, focus, paint, menu, map16 and fullscreen\n";
+    if (smoke) std::cout << "PASS native window: Space title, gear menu, scrollable help, six live tutorial scenes/pause/skip, bindings/speed, recording/replay, maps and fullscreen\n";
     return static_cast<int>(message.wParam);
 }
 } // namespace
@@ -703,7 +1395,7 @@ int main(int argc, char** argv) {
         if (!replayPath.empty()) {
             if (windowSmoke) throw std::invalid_argument("replay cannot be combined with window smoke");
             script=por2::ReplayScript::load(std::filesystem::path(replayPath));
-            if (script->level<0 && !direct) throw std::invalid_argument("replay needs --level ID or a level directive");
+            if (script->level<0 && !script->customLevel && !direct) throw std::invalid_argument("replay needs --level ID or a level/map directive");
             if (script->level>=0) level=script->level;
         }
         if (!headless) return runWindow(level, windowSmoke, screenshot,direct,fullscreen,script);

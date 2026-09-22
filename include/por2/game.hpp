@@ -33,7 +33,9 @@ bool firePortal(const TileMap& map, const Player& player, const PortalMotion& mo
 class Game {
 public:
     explicit Game(int initialLevel = 0);
+    explicit Game(const Level& customLevel);
     void tick(const InputFrame& input);
+    bool shoot(const Shot& shot);
     void restart();
     void startCampaign();
     const Level& level() const { return level_; }
@@ -43,12 +45,15 @@ public:
     const PortalMotion& motion() const { return motion_; }
     const std::vector<ShotTrace>& traces() const { return traces_; }
     bool finished() const { return finished_; }
+    bool crowned() const { return finished_ && !customLevel_ && level_.id == Campaign.back(); }
     Direction gravity() const { return gravity_; }
 private:
+    friend class Tutorial;
     void load(int id);
     void advance();
     bool atExit() const;
     Level level_;
+    std::optional<Level> customLevel_;
     Player player_;
     std::array<Portal, 2> portals_{};
     Traversal traversal_;

@@ -60,17 +60,39 @@ void Renderer::body(const Body& value, std::uint32_t color, const Portal* clip) 
               static_cast<int>(std::ceil(r.right)) - 1, static_cast<int>(std::ceil(r.bottom)) - 1, color);
 }
 
-void Renderer::draw(const Game& game, bool debug, bool grid, std::optional<Shot> preview) {
+void Renderer::draw(const Game& game, bool debug, bool grid, std::optional<Shot> preview, bool showShotTraces) {
     std::fill(pixels_.begin(), pixels_.end(), 0);
     if (grid) {
         for (int x = 0; x < WindowWidth; x += TileSize) line({x, 0}, {x, WindowHeight - 1}, 0x505050);
         for (int y = 0; y < WindowHeight; y += TileSize) line({0, y}, {WindowWidth - 1, y}, 0x505050);
     }
-    if (game.level().exit) body(*game.level().exit, 0xC8C8C8);
+    if (game.level().exit) {
+        const auto& exit=*game.level().exit;
+        body(exit, 0xC8C8C8);
+        const auto head=exit.head();
+        const int x=static_cast<int>(std::lround(head.x)),y=static_cast<int>(std::lround(head.y));
+        rectangle(x-1,y-1,x+1,y+1,0x969696);
+    }
     const int entry = game.traversal().portalIndex;
     if (game.traversal().projection && entry >= 0)
         body(*game.traversal().projection, PlayerColor, &game.portals()[1 - entry]);
     body(game.player().body, PlayerColor, entry >= 0 ? &game.portals()[entry] : nullptr);
+    if(crownVisible && (game.crowned() || crownUnlocked) && game.level().id>=0) {
+        // Cosmetic pixels only: body bounds, head and collision geometry stay unchanged.
+        const auto crown=[&](const Body& value,const Portal* clip){
+            const Vec2 forward=directionVector(value.direction), side{-forward.y,forward.x};
+            for(int u=-7;u<=7;++u)for(int v=0;v<=9;++v){
+                const int tip=std::min({std::abs(u+7),std::abs(u),std::abs(u-7)});
+                if(v>3 && v>9-tip*2)continue;
+                const Vec2 p=value.center()+forward*(30+v)+side*u;
+                if(clip && clipToFront({p.x,p.y,p.x+1,p.y+1},*clip).empty())continue;
+                rectangle(static_cast<int>(std::lround(p.x)),static_cast<int>(std::lround(p.y)),
+                          static_cast<int>(std::lround(p.x)),static_cast<int>(std::lround(p.y)),v<2?0xC59616:0xFFD700);
+            }
+        };
+        crown(game.player().body,entry>=0?&game.portals()[entry]:nullptr);
+        if(game.traversal().projection&&entry>=0)crown(*game.traversal().projection,&game.portals()[1-entry]);
+    }
     // Walls occlude both the real and projected bodies, as in the original.
     for (int x = 0; x < MapWidth; ++x)
         for (int y = 0; y < MapHeight; ++y) {
@@ -103,7 +125,7 @@ void Renderer::draw(const Game& game, bool debug, bool grid, std::optional<Shot>
             if (frame.normal.y > 0) line(start + Vec2{1, 19}, start + Vec2{19, 19}, PortalColors[id], 2);
         }
     }
-    for (const auto& trace : game.traces()) line(trace.origin, trace.end, PortalColors[trace.portal], 3);
+    if(showShotTraces)for (const auto& trace : game.traces()) line(trace.origin, trace.end, PortalColors[trace.portal], 3);
     if (preview && !game.finished()) {
         // Use the real firing rules on a copy: preview never changes live portals.
         std::array<bool, 2> available{};
@@ -146,7 +168,8 @@ void Renderer::draw(const Game& game, bool debug, bool grid, std::optional<Shot>
             // Headward direction matches the tutorial diagram (light to dark).
             const Vec2 forward = decode(portal).tangent * -1;
             const Vec2 side{-forward.y,forward.x};
-            const Vec2 center = middle + side * (available[0] && available[1] ? (id == 0 ? -5.0 : 5.0) : 0.0);
+            const Vec2 separation=std::abs(side.x)>0.5?Vec2{1,0}:Vec2{0,1};
+            const Vec2 center = middle + separation * (available[0] && available[1] ? (id == 0 ? -5.0 : 5.0) : 0.0);
             const Vec2 tip = center + forward * 8;
             // Separate the arrow from an existing same-color portal only where they overlap.
             const auto& existing = game.portals()[id];

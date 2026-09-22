@@ -1,5 +1,6 @@
 #include "por2/render.hpp"
 #include "por2/replay.hpp"
+#include "por2/tutorial.hpp"
 #include "legacy_bridge.hpp"
 #include <functional>
 #include <iostream>
@@ -19,6 +20,183 @@ std::string pose(const Player& p) {
     std::ostringstream s;
     s << p.body.position.x << ',' << p.body.position.y << " v=" << p.velocity.x << ',' << p.velocity.y;
     return s.str();
+}
+
+void exitOrientation() {
+    Game game(0);
+    auto& level=const_cast<Level&>(game.level());
+    level.map=TileMap{};
+    Renderer renderer;
+    for(int i=0;i<4;++i){
+        level.exit=Body{{400,200},static_cast<Direction>(i)};
+        const auto exit=*level.exit;
+        renderer.draw(game,false,false);
+        const Vec2 forward=directionVector(exit.direction);
+        const auto sample=[&](Vec2 p){return renderer.pixels()[static_cast<int>(p.y)*WindowWidth+static_cast<int>(p.x)];};
+        expect(sample(exit.head())==0x969696,"exit gray dot marks required head direction");
+        expect(sample(exit.head()+Vec2{1,1})==0x969696,"exit head dot matches player marker size");
+        expect(sample(exit.center()-forward*23)==0xC8C8C8,"exit tail has no head marker");
+        expect(game.level().exit->direction==exit.direction,"render does not change exit orientation");
+    }
+}
+
+void victoryCrown(){
+    Renderer renderer;
+    for(int d=0;d<4;++d){
+        Game game(Campaign.back());
+        auto& level=const_cast<Level&>(game.level());
+        level.map=TileMap{};
+        level.exit=Body{{400,250},static_cast<Direction>(d)};
+        auto& player=const_cast<Player&>(game.player());
+        player.body=*level.exit;
+        expect(!game.crowned(),"final level has no crown before victory");
+        InputFrame input;input.useExit=true;game.tick(input);
+        expect(game.finished()&&game.crowned(),"Level 14 exit awards crown");
+        const auto before=player.body;
+        renderer.draw(game,false);
+        const auto forward=directionVector(before.direction);
+        const auto sample=[&](Vec2 p){return renderer.pixels()[static_cast<int>(std::lround(p.y))*WindowWidth+static_cast<int>(std::lround(p.x))];};
+        expect(sample(before.center()+forward*38)==0xFFD700,"crown follows head in four directions");
+        expect(sample(before.center()-forward*38)==0,"no crown at tail");
+        expect(near(before.head(),player.body.head())&&near(before.position,player.body.position),"crown does not modify physical body");
+        Game custom(level);const_cast<Player&>(custom.player()).body=*level.exit;custom.tick(input);
+        expect(custom.finished()&&!custom.crowned(),"custom map with final source ID does not earn campaign crown");
+        renderer.crownUnlocked=true;
+        Game next(0);auto& nextLevel=const_cast<Level&>(next.level());nextLevel.map=TileMap{};nextLevel.exit.reset();
+        const_cast<Player&>(next.player()).body=before;
+        renderer.draw(next,false);
+        expect(sample(before.center()+forward*38)==0xFFD700,"unlocked crown remains in later games");
+        renderer.crownVisible=false;renderer.draw(next,false);
+        expect(sample(before.center()+forward*38)==0,"crown visibility can be disabled");
+        renderer.crownUnlocked=false;renderer.crownVisible=true;
+    }
+}
+
+void liveTutorial(){
+    Tutorial tutorial;
+    const auto spawn=tutorial.scene.player().body.position;
+    for(int i=0;i<20;++i)tutorial.update();
+    expect(tutorial.scene.player().body.position!=spawn,"controls tutorial uses live physics");
+    for(int stage=1;stage<=3;++stage){
+        tutorial.reset(stage);
+        const int phases=stage==1?2:stage==2?3:4;
+        for(int phase=0;phase<phases;++phase){
+            for(int i=0;i<120;++i){tutorial.update();if(i==70){
+                const bool expected=stage==1?phase==0:stage==2?phase==1:true;
+                expect(tutorial.attempted&&tutorial.accepted==expected,"live lesson shooting result matches surface/center rules");
+                if(stage==3){
+                    expect(tutorial.scene.player().body.direction==static_cast<Direction>(phase),"orientation tutorial rotates the real actor");
+                    const auto hit=castShot(tutorial.scene.level().map,tutorial.scene.traversal().aimOrigin,tutorial.aim->target);
+                    expect(hit.has_value(),"orientation lesson ray reaches wall");
+                    const auto expectedPortal=choosePortal(tutorial.scene.level().map,{},tutorial.scene.traversal().aimOrigin,tutorial.scene.player().body.direction,*hit);
+                    expect(expectedPortal&&tutorial.scene.portals()[0].code==expectedPortal->code,"orientation lesson uses actual portal orientation rule");
+                }
+            }}
+        }
+    }
+    tutorial.reset(4);
+    for(int phase=0;phase<3;++phase){
+        bool invertedProjection=false;
+        bool crossed=false;
+        for(int i=0;i<Tutorial::MappingPhaseFrames;++i){
+            const auto previous=tutorial.scene.player().body.position;
+            tutorial.update();
+            crossed|=tutorial.scene.traversal().projection.has_value();
+            if(tutorial.scene.traversal().projection)expect(tutorial.movement.left&&tutorial.scene.player().body.position!=previous,"mapping traversal advances continuously without a mid-portal pause");
+            const auto& portals=tutorial.scene.portals();
+            expect(portals[0].active()&&portals[1].active(),"mapping lesson has two real portals");
+            if(phase==2){
+                expect(dot(decode(portals[0]).tangent,decode(portals[1]).tangent)<0,"reversed blue portal faces opposite the orange portal");
+                const auto& projection=tutorial.scene.traversal().projection;
+                invertedProjection|=projection&&projection->direction==Direction::Down&&tutorial.scene.player().body.direction==Direction::Up;
+            }
+            for(double distance:{8.0,52.0}){
+                const auto a=decode(portals[0]),b=decode(portals[1]);
+                const auto point=a.anchor+a.tangent*distance;
+                expect(std::abs(dot(transformPoint(point,portals[0],portals[1])-b.anchor,b.tangent)-distance)<Epsilon,"light and dark ends retain corresponding positions");
+            }
+        }
+        expect(crossed,"each mapping example crosses both portal mouths");
+        expect(tutorial.scene.player().body.position.x>500&&tutorial.scene.traversal().lockedPortal<0&&!tutorial.scene.traversal().projection,"each mapping example fully emerges from the orange portal");
+        expect(tutorial.scene.player().body.direction==(phase==0?Direction::Up:Direction::Down),"each mapping example ends in the expected orientation");
+        if(phase==2){
+            expect(invertedProjection,"reversed portal demonstrates an upside-down projected body");
+            expect(tutorial.scene.player().body.direction==Direction::Down&&tutorial.scene.player().body.position.x>500,"actor emerges from orange portal upside down: x="+std::to_string(tutorial.scene.player().body.position.x)+" direction="+std::to_string(static_cast<int>(tutorial.scene.player().body.direction)));
+            expect(tutorial.scene.traversal().lockedPortal<0,"inverted actor fully exits the orange portal");
+        }
+    }
+    tutorial.reset(5);bool locked=false,rejected=false,replaced=false,released=false;
+    for(int i=0;i<470;++i){
+        tutorial.update();
+        locked|=tutorial.scene.traversal().lockedPortal>=0;
+        if(tutorial.heldFrames==40)rejected=tutorial.attempted&&!tutorial.accepted;
+        if(tutorial.heldFrames==140)replaced=tutorial.attempted&&tutorial.accepted;
+        if(tutorial.heldFrames>200&&tutorial.scene.traversal().lockedPortal<0)released=true;
+    }
+    expect(locked,"locking lesson enters real partial-body traversal");
+    expect(rejected,"locking lesson actually rejects locked portal shot");
+    expect(replaced,"locking lesson actually moves minority portal");
+    expect(released,"locking lesson shows release after leaving the portal");
+}
+
+void editorMaps(){
+    const auto path=std::filesystem::path(__FILE__).parent_path().parent_path()/"levels"/"example.json";
+    const auto level=loadEditorLevel(path,1001);
+    expect(level.name=="JSON 示例关卡"&&level.spawn.position==Vec2{61,521},"editor metadata and grid-to-pixel coordinates");
+    expect(level.map.at(3,29)==Tile::PortalSurface&&level.map.at(3,26)==Tile::Empty,"row-major editor tiles");
+    Game game(level);game.tick({});game.restart();
+    expect(game.level().id==1001&&game.player().body.position==level.spawn.position,"custom restart preserves map");
+    const_cast<Player&>(game.player()).body=*level.exit;InputFrame enter;enter.useExit=true;game.tick(enter);
+    expect(game.finished()&&game.level().id==1001,"custom exit finishes standalone map");
+    InputFrame restart;restart.restart=true;game.tick(restart);
+    expect(!game.finished()&&game.level().editorJson==level.editorJson,"custom completion restarts same map");
+    Recorder recorder;recorder.start(level);InputFrame input;input.movement.right=true;
+    for(int i=0;i<10;++i){recorder.capture(input);game.tick(input);}
+    std::istringstream source(recorder.text());auto script=ReplayScript::parse(source);
+    expect(script.customLevel.has_value(),"custom recording embeds map");
+    Replay replay;Game restored;replay.start(script,0,restored);while(!replay.completed)replay.step(restored);
+    expect(restored.player().body.position==game.player().body.position&&restored.level().name==level.name,"embedded map recording replays without source file");
+    auto change=[&](std::string from,std::string to){auto json=level.editorJson;const auto at=json.find(from);expect(at!=std::string::npos,"JSON test mutation exists");json.replace(at,from.size(),to);return json;};
+    for(const auto& bad:{change("\"width\":50","\"width\":49"),change("\"direction\":0","\"direction\":4"),change("\"x\":3","\"x\":3.5"),change("\"y\":26","\"y\":29"),change("\"spawn\":{\"x\":3,\"y\":26,\"direction\":0}","\"spawn\":null"),level.editorJson+"garbage",std::string(1024*1024+1,' ')}){
+        bool rejected=false;try{parseEditorLevel(bad);}catch(const std::exception&){rejected=true;}expect(rejected,"invalid editor map rejected");
+    }
+    const auto unicode=parseEditorLevel(change("JSON 示例关卡","\\u6d4b\\u8bd5 # \\ud83d\\ude00"));
+    expect(unicode.name=="测试 # 😀","escaped Unicode and surrogate pair decoded");
+    Recorder unicodeRecorder;unicodeRecorder.start(unicode);unicodeRecorder.capture({});
+    std::istringstream unicodeText(unicodeRecorder.text());expect(ReplayScript::parse(unicodeText).customLevel->name==unicode.name,"map hash character is not treated as a replay comment");
+}
+
+void recordingRoundTrip() {
+    Recorder numbered;numbered.start(16);numbered.capture({});
+    expect(numbered.text().find("version 2\nlevel 14\n")!=std::string::npos,"recordings write the menu ID");
+    std::istringstream numberedText(numbered.text());
+    expect(ReplayScript::parse(numberedText).level==16,"menu-number recording restores the original map");
+    Recorder recorder;recorder.start(0);
+    Game actual(0);
+    std::vector<Player> states;
+    for(int frame=0;frame<50;++frame){
+        InputFrame input;input.movement={frame%3==0,frame%3!=0,frame%7==0,frame%11==0};
+        input.gravityTurns=frame%13==0?1:0;
+        if(frame==8){input.shots={{0,{260.12345678901234,389}},{1,{730,389.9876543210987}}};}
+        input.restart=frame==25;input.useExit=frame==40;
+        recorder.capture(input);actual.tick(input);states.push_back(actual.player());
+    }
+    std::istringstream stream(recorder.text());const auto script=ReplayScript::parse(stream);
+    expect(script.totalFrames==50&&script.level==0,"recorded script preserves level and logical frame count");
+    Replay replay;Game playback(0);replay.start(script,0,playback);
+    for(const auto& state:states){replay.step(playback);expect(playback.player().body.position==state.body.position&&playback.player().velocity==state.velocity,"recorded combined inputs reproduce every frame");}
+    expect(playback.gravity()==actual.gravity(),"recorded gravity turns replay exactly");
+    const auto shotAction=std::find_if(script.actions.begin(),script.actions.end(),[](const ScriptAction& action){return !action.input.shots.empty();});
+    expect(shotAction!=script.actions.end(),"recording retains shots");
+    expect(shotAction->input.shots[0].target.x==260.12345678901234,"recording preserves exact aiming precision");
+    expect(shotAction->input.shots.size()==2&&shotAction->input.movement.right,"recording preserves simultaneous movement and both shots");
+    recorder.start(0);for(int i=0;i<10;++i)recorder.capture({});
+    expect(recorder.script.actions.size()==1&&recorder.script.actions[0].frames==10,"idle frames are losslessly compressed");
+    recorder.active=false;recorder.capture({});expect(recorder.script.totalFrames==10,"stopped recorder ignores inputs");
+    for(const auto* bad:{"f 0 0 0","f 1 512 0","f 1 0 -1","f 1 0 1 2 1 1","f 1 0 1 0 nan 1"}){
+        bool rejected=false;try{std::istringstream input(bad);ReplayScript::parse(input);}catch(const std::exception&){rejected=true;}
+        expect(rejected,"malformed recorded frame rejected");
+    }
 }
 
 void scriptReplay() {
@@ -148,6 +326,17 @@ void mapsAndTransforms() {
 }
 
 void placementPreview() {
+    for(int direction=0;direction<4;++direction){
+        auto level=makeLevel(0);level.spawn={{350,300},static_cast<Direction>(direction)};
+        Game oriented(level);Renderer rendered;
+        auto portals=oriented.portals();std::vector<ShotTrace> traces;
+        const Shot aim{0,{260,389}};
+        expect(firePortal(level.map,oriented.player(),oriented.motion(),portals,aim,traces),"oriented preview fixture places portal");
+        const auto portal=portals[0];const Vec2 center=pixels(portal.tile)+Vec2{10,30};
+        rendered.draw(oriented,false,false,aim);
+        expect(rendered.pixels()[static_cast<int>(center.y)*WindowWidth+static_cast<int>(center.x)-5]==0x3296FF,"blue arrow stays on screen left for every head orientation");
+        expect(rendered.pixels()[static_cast<int>(center.y)*WindowWidth+static_cast<int>(center.x)+5]==0xFF9632,"orange arrow stays on screen right for every head orientation");
+    }
     Game game;
     Renderer baseline, preview;
     baseline.draw(game);
@@ -165,7 +354,8 @@ void placementPreview() {
         const Vec2 forward=decode(portals[id]).tangent*-1;
         const Vec2 side{-forward.y,forward.x};
         for (int candidate=0;candidate<2;++candidate) {
-            const Vec2 arrow=center+side*(candidate==0?-5.0:5.0);
+            const Vec2 separation=std::abs(side.x)>0.5?Vec2{1,0}:Vec2{0,1};
+            const Vec2 arrow=center+separation*(candidate==0?-5.0:5.0);
             const auto color=candidate==0?0x3296FFu:0xFF9632u;
             expect(preview.pixels()[static_cast<int>(arrow.y)*WindowWidth+static_cast<int>(arrow.x)]==color,
                    "both available portal colors appear side by side regardless of selected portal");
@@ -597,10 +787,15 @@ void gravityControls() {
 
 int main() {
     const std::pair<const char*, std::function<void()>> suites[]{
+        {"four gravity directions, screen controls, support and portal stress", gravityControls},
+        {"cosmetic Level 14 victory crown in four directions", victoryCrown},
+        {"live tutorial physics, shooting, orientations and portal locking", liveTutorial},
+        {"editor JSON validation, custom gameplay and self-contained recordings", editorMaps},
+        {"recording combined inputs, exact replay and compression", recordingRoundTrip},
+        {"exit head direction markers in all four orientations", exitOrientation},
         {"script parsing, exact frame playback, restart and completion", scriptReplay},
         {"boundary contact restarts current level", boundaryRestart},
         {"non-mutating placement preview and actual portal position", placementPreview},
-        {"four gravity directions, screen controls, support and portal stress", gravityControls},
         {"editable level data and 64 invertible portal transforms", mapsAndTransforms},
         {"actual ray faces, direction rules and corner/vertical rays", raysAndDirections},
         {"floating point collision, high speed, recovery and map13 geometry", terrain},
