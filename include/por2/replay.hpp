@@ -19,6 +19,7 @@ struct ReplayScript {
         ReplayScript result;
         std::string line;
         int number = 0;
+        bool menuIds = false;
         while (std::getline(stream,line)) {
             ++number;
             if (number==1 && line.compare(0,3,"\xEF\xBB\xBF")==0) line.erase(0,3);
@@ -27,9 +28,15 @@ struct ReplayScript {
             std::string op,extra;
             if (!(row>>op)) continue;
             auto fail=[&]() { throw std::runtime_error("Script line "+std::to_string(number)+": invalid command or arguments"); };
+            if (op=="version") {
+                int version=0;
+                if(menuIds||result.level!=-1||!result.actions.empty()||!(row>>version)||version!=2||(row>>extra))fail();
+                menuIds=true;continue;
+            }
             if (op=="level") {
                 if (!result.actions.empty() || result.level!=-1 || !(row>>result.level) ||
-                    result.level<0 || result.level>16 || (row>>extra)) fail();
+                    result.level<0 || result.level>(menuIds?static_cast<int>(Campaign.size())-1:16) || (row>>extra)) fail();
+                if(menuIds)result.level=Campaign[result.level];
                 continue;
             }
             ScriptAction action;

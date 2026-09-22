@@ -22,6 +22,16 @@ std::string pose(const Player& p) {
 }
 
 void scriptReplay() {
+    for(int index=0;index<static_cast<int>(Campaign.size());++index){
+        std::istringstream modern("version 2\nlevel "+std::to_string(index)+"\nz 1\n");
+        expect(ReplayScript::parse(modern).level==Campaign[index],"version 2 uses menu level numbers");
+        std::istringstream legacy("level "+std::to_string(Campaign[index])+"\nz 1\n");
+        expect(ReplayScript::parse(legacy).level==Campaign[index],"legacy replays retain source IDs");
+    }
+    for(const auto* input:{"version 2\nlevel 15\nz 1","version 3\nz 1","level 0\nversion 2\nz 1","version 2\nversion 2\nz 1"}){
+        bool rejected=false;try{std::istringstream stream(input);ReplayScript::parse(stream);}catch(const std::exception&){rejected=true;}
+        expect(rejected,"invalid version or menu level rejected");
+    }
     std::istringstream text("\xEF\xBB\xBF# comment\nlevel 0\nd 2\nz 1\ns 0 260 389\ne 1\n");
     const auto script=ReplayScript::parse(text);
     expect(script.level==0 && script.totalFrames==5 && script.actions.size()==4,"script BOM, comments and frame count");

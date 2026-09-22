@@ -572,8 +572,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
             DrawTextW(dc, L"Completed!  R: play again    Esc: levels", -1, &area, DT_CENTER | DT_SINGLELINE);
         }
         if(!app->menu && !app->intro && !app->levelIntroActive()) {
-            const auto entry=std::find(app->levels.begin(),app->levels.end(),app->game.level().id);
-            const std::string caption = "Level" + std::to_string(entry-app->levels.begin()) + "  " + app->game.level().name;
+            const auto level=app->replay.active?por2::makeLevel(app->replay.initialLevel):app->game.level();
+            const auto entry=std::find(por2::Campaign.begin(),por2::Campaign.end(),level.id);
+            const std::string caption = (entry!=por2::Campaign.end()?"Level"+std::to_string(entry-por2::Campaign.begin()):"实验地图") + "  " + level.name;
             const std::wstring wide=utf8(caption);
             RECT levelArea{690, 548, 975, 588};
             SetBkMode(dc, TRANSPARENT);
